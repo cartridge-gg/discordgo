@@ -6,8 +6,11 @@ package dave
 
 // Exported from this file; declared here so callbacks.go's CGO preamble
 // knows their C types when we pass them as function-pointer callbacks.
-extern void goDaveOnMLSFailure(const char* source, const char* reason, void* userData);
-extern void goDaveOnLogSink(int severity, const char* file, int line, const char* message);
+// Signatures match cgo's //export-generated prototypes exactly (plain
+// char*, not const char*) — any mismatch trips "conflicting types" at
+// _cgo_export.c compile time.
+extern void goDaveOnMLSFailure(char* source, char* reason, void* userData);
+extern void goDaveOnLogSink(int severity, char* file, int line, char* message);
 
 static inline void dave_install_log_sink(void) {
     daveSetLogSinkCallback((DAVELogSinkCallback)goDaveOnLogSink);

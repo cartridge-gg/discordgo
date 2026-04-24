@@ -5,8 +5,10 @@ package dave
 #include <dave/dave.h>
 
 // Declared in callbacks.go; referenced here so session.go's preamble
-// knows the trampoline signature when we pass it as a callback.
-extern void goDaveOnMLSFailure(const char* source, const char* reason, void* userData);
+// knows the trampoline signature when we pass it as a callback. The
+// signature must match cgo's //export-generated prototype exactly
+// (plain char*, not const char*).
+extern void goDaveOnMLSFailure(char* source, char* reason, void* userData);
 
 // Convenience wrapper so the Go side doesn't need to name-mangle the
 // trampoline function-pointer cast for each daveSessionCreate call.
