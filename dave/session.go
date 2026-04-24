@@ -1,7 +1,19 @@
 package dave
 
-// #include <stdlib.h>
-// #include <dave/dave.h>
+/*
+#include <stdlib.h>
+#include <dave/dave.h>
+
+// Declared in callbacks.go; referenced here so session.go's preamble
+// knows the trampoline signature when we pass it as a callback.
+extern void goDaveOnMLSFailure(const char* source, const char* reason, void* userData);
+
+// Convenience wrapper so the Go side doesn't need to name-mangle the
+// trampoline function-pointer cast for each daveSessionCreate call.
+static inline DAVESessionHandle dave_session_create(const char* authSessionId, void* userData) {
+    return daveSessionCreate(NULL, authSessionId, (DAVEMLSFailureCallback)goDaveOnMLSFailure, userData);
+}
+*/
 import "C"
 
 import (
