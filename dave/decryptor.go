@@ -139,13 +139,13 @@ func (d *Decryptor) Stats(mediaType MediaType) DecryptorStats {
 	var s C.DAVEDecryptorStats
 	C.daveDecryptorGetStats(d.handle, C.DAVEMediaType(mediaType), &s)
 	return DecryptorStats{
-		Passthrough:       uint64(s.passthroughCount),
-		DecryptSuccess:    uint64(s.decryptSuccessCount),
-		DecryptFailure:    uint64(s.decryptFailureCount),
-		DecryptDuration:   uint64(s.decryptDuration),
-		DecryptAttempts:   uint64(s.decryptAttempts),
-		MissingKey:        uint64(s.decryptMissingKeyCount),
-		InvalidNonce:      uint64(s.decryptInvalidNonceCount),
+		Passthrough:     uint64(s.passthroughCount),
+		DecryptSuccess:  uint64(s.decryptSuccessCount),
+		DecryptFailure:  uint64(s.decryptFailureCount),
+		DecryptDuration: uint64(s.decryptDuration),
+		DecryptAttempts: uint64(s.decryptAttempts),
+		MissingKey:      uint64(s.decryptMissingKeyCount),
+		InvalidNonce:    uint64(s.decryptInvalidNonceCount),
 	}
 }
 

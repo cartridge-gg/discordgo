@@ -17,10 +17,10 @@ import (
 type Session struct {
 	mu sync.Mutex
 
-	handle  C.DAVESessionHandle
+	handle    C.DAVESessionHandle
 	handleRef cgo.Handle // cgo handle exposing this Session to the C callback
-	onFail  MLSFailureFunc
-	destroy sync.Once
+	onFail    MLSFailureFunc
+	destroy   sync.Once
 }
 
 // NewSession allocates a DAVESessionHandle and registers the failure callback.

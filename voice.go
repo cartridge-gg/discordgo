@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cartridge-gg/discordgo/dave"
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/nacl/secretbox"
 )
@@ -67,6 +68,10 @@ type VoiceConnection struct {
 	op2 voiceOP2
 
 	voiceSpeakingUpdateHandlers []VoiceSpeakingUpdateHandler
+
+	// DAVE (Discord Audio/Video E2EE) state. nil until the voice gateway
+	// sends opcode 24 announcing an E2EE epoch; see voice_dave.go.
+	dave *daveState
 }
 
 // VoiceSpeakingUpdateHandler type provides a function definition for the
@@ -210,6 +215,13 @@ func (v *VoiceConnection) Close() {
 
 		v.wsConn = nil
 	}
+
+	// Release DAVE state last so the decrypt path in opusReceiver has a
+	// chance to finish any in-flight frame before libdave handles vanish.
+	if v.dave != nil {
+		v.dave.close()
+		v.dave = nil
+	}
 }
 
 // AddHandler adds a Handler for VoiceSpeakingUpdate events.
@@ -316,16 +328,23 @@ func (v *VoiceConnection) open() (err error) {
 	}
 
 	type voiceHandshakeData struct {
-		ServerID  string `json:"server_id"`
-		UserID    string `json:"user_id"`
-		SessionID string `json:"session_id"`
-		Token     string `json:"token"`
+		ServerID               string `json:"server_id"`
+		UserID                 string `json:"user_id"`
+		SessionID              string `json:"session_id"`
+		Token                  string `json:"token"`
+		MaxDAVEProtocolVersion uint16 `json:"max_dave_protocol_version"`
 	}
 	type voiceHandshakeOp struct {
 		Op   int                `json:"op"` // Always 0
 		Data voiceHandshakeData `json:"d"`
 	}
-	data := voiceHandshakeOp{0, voiceHandshakeData{v.GuildID, v.UserID, v.sessionID, v.token}}
+	data := voiceHandshakeOp{0, voiceHandshakeData{
+		ServerID:               v.GuildID,
+		UserID:                 v.UserID,
+		SessionID:              v.sessionID,
+		Token:                  v.token,
+		MaxDAVEProtocolVersion: dave.MaxSupportedProtocolVersion(),
+	}}
 
 	v.wsMutex.Lock()
 	err = v.wsConn.WriteJSON(data)
@@ -352,7 +371,7 @@ func (v *VoiceConnection) wsListen(wsConn *websocket.Conn, close <-chan struct{}
 	v.log(LogInformational, "called")
 
 	for {
-		_, message, err := v.wsConn.ReadMessage()
+		messageType, message, err := v.wsConn.ReadMessage()
 		if err != nil {
 			// 4014 indicates a manual disconnection by someone in the guild;
 			// we shouldn't reconnect.
@@ -408,12 +427,18 @@ func (v *VoiceConnection) wsListen(wsConn *websocket.Conn, close <-chan struct{}
 			return
 		}
 
-		// Pass received message to voice event handler
+		// Pass received message to voice event handler. DAVE's binary
+		// opcodes (25, 27, 29, 30) arrive as websocket binary frames; every
+		// other opcode is JSON in a text frame.
 		select {
 		case <-close:
 			return
 		default:
-			go v.onEvent(message)
+			if messageType == websocket.BinaryMessage {
+				go v.handleDAVEBinaryFrame(message)
+			} else {
+				go v.onEvent(message)
+			}
 		}
 	}
 }
@@ -497,6 +522,14 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		for _, h := range v.voiceSpeakingUpdateHandlers {
 			h(v, voiceSpeakingUpdate)
 		}
+
+		// Prepare a DAVE decryptor for this SSRC/user if E2EE is active.
+		v.onDAVESpeakingUpdate(voiceSpeakingUpdate)
+
+	case voiceOpDAVEPrepareTransition,
+		voiceOpDAVEExecuteTransition,
+		voiceOpDAVEPrepareEpoch:
+		v.handleDAVEJSONEvent(e.Operation, e.RawData)
 
 	default:
 		v.log(LogDebug, "unknown voice operation, %d, %s", e.Operation, string(e.RawData))
@@ -874,6 +907,21 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			}
 		}
 
+		// DAVE E2EE: peel the inner per-sender AEAD envelope. Active only
+		// when the voice gateway has negotiated a DAVE session (see
+		// voice_dave.go). If libdave is in passthrough or no decryptor
+		// exists for this SSRC yet, Decrypt returns ErrDecryptMissingKey
+		// and we fall through to delivering the outer-decrypted bytes.
+		if v.dave != nil {
+			if dec := v.daveDecryptorFor(p.SSRC); dec != nil {
+				if plain, derr := dec.Decrypt(dave.MediaAudio, p.Opus); derr == nil {
+					p.Opus = plain
+				} else if derr != dave.ErrDecryptMissingKey {
+					v.log(LogDebug, "DAVE decrypt ssrc=%d: %s", p.SSRC, derr)
+				}
+			}
+		}
+
 		if c != nil {
 			select {
 			case c <- &p:
@@ -882,6 +930,21 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			}
 		}
 	}
+}
+
+// daveDecryptorFor returns the DAVE Decryptor for the given SSRC, or nil if
+// DAVE is inactive or no decryptor has been minted yet. Called from the hot
+// path in opusReceiver so it holds the dave.mu briefly then releases.
+func (v *VoiceConnection) daveDecryptorFor(ssrc uint32) *dave.Decryptor {
+	if v.dave == nil {
+		return nil
+	}
+	v.dave.mu.Lock()
+	defer v.dave.mu.Unlock()
+	if s, ok := v.dave.decryptors[ssrc]; ok {
+		return s.decryptor
+	}
+	return nil
 }
 
 // Reconnect will close down a voice connection then immediately try to
