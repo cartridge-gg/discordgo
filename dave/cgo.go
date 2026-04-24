@@ -9,7 +9,13 @@ package dave
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/libdave/cpp/includes
-#cgo linux LDFLAGS: ${SRCDIR}/libdave/cpp/build/libdave.a -lstdc++ -lssl -lcrypto -lm -ldl -lpthread
-#cgo darwin LDFLAGS: ${SRCDIR}/libdave/cpp/build/libdave.a -lc++ -lssl -lcrypto
 */
 import "C"
+
+// Default LDFLAGS are omitted on purpose: libdave's transitive deps
+// (mlspp, OpenSSL, nlohmann_json) are all static archives under
+// dave/libdave/cpp/build/vcpkg_installed/<triplet>/lib. Consumers must
+// pass the full archive list via CGO_LDFLAGS at build time — the
+// goclaw Dockerfile globs it out of vcpkg_installed. Hardcoding
+// -lssl/-lcrypto here would force the linker to look them up in the
+// system library path, which doesn't carry them in our builder image.
