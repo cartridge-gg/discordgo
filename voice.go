@@ -333,33 +333,11 @@ func (v *VoiceConnection) open() (err error) {
 		return
 	}
 
-	type voiceHandshakeData struct {
-		ServerID               string `json:"server_id"`
-		UserID                 string `json:"user_id"`
-		SessionID              string `json:"session_id"`
-		Token                  string `json:"token"`
-		MaxDAVEProtocolVersion uint16 `json:"max_dave_protocol_version"`
-	}
-	type voiceHandshakeOp struct {
-		Op   int                `json:"op"` // Always 0
-		Data voiceHandshakeData `json:"d"`
-	}
-	data := voiceHandshakeOp{0, voiceHandshakeData{
-		ServerID:               v.GuildID,
-		UserID:                 v.UserID,
-		SessionID:              v.sessionID,
-		Token:                  v.token,
-		MaxDAVEProtocolVersion: dave.MaxSupportedProtocolVersion(),
-	}}
-
-	v.wsMutex.Lock()
-	err = v.wsConn.WriteJSON(data)
-	v.wsMutex.Unlock()
-	if err != nil {
-		v.log(LogWarning, "error sending init packet, %s", err)
-		return
-	}
-
+	// IMPORTANT: in voice gateway v4+, Discord requires HELLO (OP8) to be
+	// received BEFORE the client sends IDENTIFY. v3 accepted out-of-order
+	// identify; v8 closes the connection with code 4006 ("Session is no
+	// longer valid"). The IDENTIFY is now sent from the OP8 handler in
+	// onEvent (see sendVoiceIdentify). We just spawn the listener here.
 	v.close = make(chan struct{})
 	go v.wsListen(v.wsConn, v.close)
 
@@ -520,7 +498,10 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		}
 		return
 
-	case 8: // HELLO (voice gateway v4+) — carries heartbeat_interval
+	case 8: // HELLO (voice gateway v4+) — carries heartbeat_interval and
+		// is the protocol-mandated trigger to send IDENTIFY. v3 accepted
+		// identify-before-hello; v8 closes with code 4006 if we send
+		// identify before HELLO arrives.
 		var hello struct {
 			HeartbeatInterval float64 `json:"heartbeat_interval"`
 		}
@@ -543,6 +524,10 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		}
 		v.log(LogInformational, "voice: starting heartbeat (interval=%vms)", ms)
 		go v.wsHeartbeat(v.wsConn, v.close, time.Duration(ms))
+		// Send IDENTIFY now that HELLO has been seen.
+		if err := v.sendVoiceIdentify(); err != nil {
+			v.log(LogError, "voice: identify after HELLO failed: %s", err)
+		}
 		return
 
 	case 5:
@@ -573,6 +558,45 @@ func (v *VoiceConnection) onEvent(message []byte) {
 	}
 
 	return
+}
+
+// sendVoiceIdentify writes the voice-gateway IDENTIFY (op 0) frame.
+// Per the v4+ protocol spec, this MUST be called only after the server
+// has sent HELLO (op 8). Sending IDENTIFY before HELLO results in a
+// close-code 4006 ("Session is no longer valid"). The OP8 handler in
+// onEvent invokes this; Open() must NOT call it directly.
+func (v *VoiceConnection) sendVoiceIdentify() error {
+	type voiceHandshakeData struct {
+		ServerID               string `json:"server_id"`
+		UserID                 string `json:"user_id"`
+		SessionID              string `json:"session_id"`
+		Token                  string `json:"token"`
+		MaxDAVEProtocolVersion uint16 `json:"max_dave_protocol_version"`
+	}
+	type voiceHandshakeOp struct {
+		Op   int                `json:"op"` // Always 0
+		Data voiceHandshakeData `json:"d"`
+	}
+	v.RLock()
+	wsConn := v.wsConn
+	guildID := v.GuildID
+	userID := v.UserID
+	sessionID := v.sessionID
+	token := v.token
+	v.RUnlock()
+	if wsConn == nil {
+		return fmt.Errorf("no voice websocket")
+	}
+	data := voiceHandshakeOp{0, voiceHandshakeData{
+		ServerID:               guildID,
+		UserID:                 userID,
+		SessionID:              sessionID,
+		Token:                  token,
+		MaxDAVEProtocolVersion: dave.MaxSupportedProtocolVersion(),
+	}}
+	v.wsMutex.Lock()
+	defer v.wsMutex.Unlock()
+	return wsConn.WriteJSON(data)
 }
 
 type voiceHeartbeatOp struct {
