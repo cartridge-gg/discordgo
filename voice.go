@@ -678,8 +678,16 @@ func (v *VoiceConnection) udpOpen() (err error) {
 	port := binary.BigEndian.Uint16(rb[len(rb)-2:])
 
 	// Take the data from above and send it back to Discord to finalize
-	// the UDP connection handshake.
-	data := voiceUDPOp{1, voiceUDPD{"udp", voiceUDPData{ip, port, "xsalsa20_poly1305"}}}
+	// the UDP connection handshake. Pick the strongest encryption mode
+	// from those Discord advertised in OP2 — see voice_aead.go for the
+	// ordered preference list (AEAD modes preferred, xsalsa fallback).
+	mode := selectVoiceEncryptionMode(v.op2.Modes)
+	if mode == "" {
+		v.log(LogError, "no supported voice encryption mode in OP2 modes=%v", v.op2.Modes)
+		return
+	}
+	v.log(LogInformational, "voice: selected encryption mode %s (advertised: %v)", mode, v.op2.Modes)
+	data := voiceUDPOp{1, voiceUDPD{"udp", voiceUDPData{ip, port, mode}}}
 
 	v.wsMutex.Lock()
 	err = v.wsConn.WriteJSON(data)
@@ -887,13 +895,25 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 		p.Sequence = binary.BigEndian.Uint16(recvbuf[2:4])
 		p.Timestamp = binary.BigEndian.Uint32(recvbuf[4:8])
 		p.SSRC = binary.BigEndian.Uint32(recvbuf[8:12])
-		// decrypt opus data
-		copy(nonce[:], recvbuf[0:12])
 
-		if opus, ok := secretbox.Open(nil, recvbuf[12:rlen], &nonce, &v.op4.SecretKey); ok {
-			p.Opus = opus
+		// decrypt opus data. The cipher is whatever Discord and we
+		// negotiated in OP1/OP2 (see selectVoiceEncryptionMode). AEAD
+		// modes carry the nonce in the trailing 4 bytes; the legacy
+		// xsalsa mode uses the RTP header as nonce.
+		if voiceModeUsesAEAD(v.op4.Mode) {
+			plain, derr := decryptVoicePacket(v.op4.Mode, recvbuf[:rlen], &v.op4.SecretKey)
+			if derr != nil {
+				v.log(LogDebug, "voice: outer decrypt (%s) failed: %s", v.op4.Mode, derr)
+				continue
+			}
+			p.Opus = plain
 		} else {
-			continue
+			copy(nonce[:], recvbuf[0:12])
+			if opus, ok := secretbox.Open(nil, recvbuf[12:rlen], &nonce, &v.op4.SecretKey); ok {
+				p.Opus = opus
+			} else {
+				continue
+			}
 		}
 
 		// extension bit set, and not a RTCP packet
