@@ -470,8 +470,14 @@ func (v *VoiceConnection) onEvent(message []byte) {
 			return
 		}
 
-		// Start the voice websocket heartbeat to keep the connection alive
-		go v.wsHeartbeat(v.wsConn, v.close, v.op2.HeartbeatInterval)
+		// Start the voice websocket heartbeat. Voice gateway v3 carried
+		// heartbeat_interval inside OP2 (READY); v4+ moved it to OP8
+		// (HELLO) and OP2 no longer has it. Skip starting the ticker
+		// here when the value is zero — onEvent's case 8 handler below
+		// is responsible for starting it on the v4+ path.
+		if v.op2.HeartbeatInterval > 0 {
+			go v.wsHeartbeat(v.wsConn, v.close, v.op2.HeartbeatInterval)
+		}
 		// TODO monitor a chan/bool to verify this was successful
 
 		// Start the UDP connection
@@ -512,6 +518,24 @@ func (v *VoiceConnection) onEvent(message []byte) {
 			v.log(LogError, "OP4 unmarshall error, %s, %s", err, string(e.RawData))
 			return
 		}
+		return
+
+	case 8: // HELLO (voice gateway v4+) — carries heartbeat_interval
+		var hello struct {
+			HeartbeatInterval float64 `json:"heartbeat_interval"`
+		}
+		if err := json.Unmarshal(e.RawData, &hello); err != nil {
+			v.log(LogError, "OP8 unmarshall error, %s, %s", err, string(e.RawData))
+			return
+		}
+		// Discord sends heartbeat_interval in milliseconds.
+		interval := time.Duration(hello.HeartbeatInterval) * time.Millisecond
+		if interval <= 0 {
+			v.log(LogError, "OP8 hello carried non-positive heartbeat_interval %v", hello.HeartbeatInterval)
+			return
+		}
+		v.log(LogInformational, "voice: starting heartbeat (interval=%s)", interval)
+		go v.wsHeartbeat(v.wsConn, v.close, interval)
 		return
 
 	case 5:
