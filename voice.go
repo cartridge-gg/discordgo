@@ -528,14 +528,21 @@ func (v *VoiceConnection) onEvent(message []byte) {
 			v.log(LogError, "OP8 unmarshall error, %s, %s", err, string(e.RawData))
 			return
 		}
-		// Discord sends heartbeat_interval in milliseconds.
-		interval := time.Duration(hello.HeartbeatInterval) * time.Millisecond
-		if interval <= 0 {
-			v.log(LogError, "OP8 hello carried non-positive heartbeat_interval %v", hello.HeartbeatInterval)
+		// Discord sends heartbeat_interval in milliseconds. Pass the raw
+		// integer count as a time.Duration — wsHeartbeat then multiplies
+		// by time.Millisecond to scale to the correct ticker rate. This
+		// quirk is inherited from upstream's v3 path: voiceOP2 declares
+		// HeartbeatInterval as time.Duration, which json unmarshals as
+		// raw nanoseconds, and wsHeartbeat compensates by multiplying.
+		// We must mirror that contract or wsHeartbeat over- or
+		// under-shoots by 1e6.
+		ms := hello.HeartbeatInterval
+		if ms <= 0 {
+			v.log(LogError, "OP8 hello carried non-positive heartbeat_interval %v", ms)
 			return
 		}
-		v.log(LogInformational, "voice: starting heartbeat (interval=%s)", interval)
-		go v.wsHeartbeat(v.wsConn, v.close, interval)
+		v.log(LogInformational, "voice: starting heartbeat (interval=%vms)", ms)
+		go v.wsHeartbeat(v.wsConn, v.close, time.Duration(ms))
 		return
 
 	case 5:
