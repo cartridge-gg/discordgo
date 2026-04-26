@@ -317,8 +317,14 @@ func (v *VoiceConnection) open() (err error) {
 		v.Lock()
 	}
 
-	// Connect to VoiceConnection Websocket
-	vg := "wss://" + strings.TrimSuffix(v.endpoint, ":80")
+	// Connect to VoiceConnection Websocket. The ?v=8 query is required
+	// for DAVE: Discord's voice gateway defaults to v3, which predates
+	// DAVE, AEAD encryption modes, and the opcode 21-31 family. On a
+	// DAVE-eligible call, a v3 connection is accepted but the SFU
+	// silently refuses to route audio to it (the bot appears in the
+	// roster but receives no Op4/Op5/UDP traffic). Upgrade to v8 so we
+	// participate in the MLS handshake and the new encryption suite.
+	vg := "wss://" + strings.TrimSuffix(v.endpoint, ":80") + "/?v=8"
 	v.log(LogInformational, "connecting to voice endpoint %s", vg)
 	v.wsConn, _, err = v.session.Dialer.Dial(vg, nil)
 	if err != nil {
