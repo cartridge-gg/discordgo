@@ -69,6 +69,14 @@ type VoiceConnection struct {
 
 	voiceSpeakingUpdateHandlers []VoiceSpeakingUpdateHandler
 
+	// lastSeq is the highest sequence number we've seen on a server-sent
+	// frame. Voice gateway v8 stamps every server message with a `s`
+	// field and expects clients to echo the latest in heartbeat payloads
+	// as `seq_ack`. Sending heartbeats without it on a v8 connection is
+	// what causes the gateway to close with code 4006 ("session is no
+	// longer valid") about ~1 heartbeat interval after IDENTIFY.
+	lastSeq int64
+
 	// DAVE (Discord Audio/Video E2EE) state. nil until the voice gateway
 	// sends opcode 24 announcing an E2EE epoch; see voice_dave.go.
 	dave *daveState
@@ -333,11 +341,15 @@ func (v *VoiceConnection) open() (err error) {
 		return
 	}
 
-	// IMPORTANT: in voice gateway v4+, Discord requires HELLO (OP8) to be
-	// received BEFORE the client sends IDENTIFY. v3 accepted out-of-order
-	// identify; v8 closes the connection with code 4006 ("Session is no
-	// longer valid"). The IDENTIFY is now sent from the OP8 handler in
-	// onEvent (see sendVoiceIdentify). We just spawn the listener here.
+	// Voice gateway expects IDENTIFY immediately on connect (unlike the
+	// main gateway which sends HELLO first). v3..v8 all want this. The
+	// HELLO opcode (OP8) arrives AFTER identify in voice gateway and
+	// just carries heartbeat_interval; it does NOT gate identify.
+	if err = v.sendVoiceIdentify(); err != nil {
+		v.log(LogWarning, "error sending voice identify, %s", err)
+		return
+	}
+
 	v.close = make(chan struct{})
 	go v.wsListen(v.wsConn, v.close)
 
@@ -439,6 +451,15 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		return
 	}
 
+	// Voice gateway v8 stamps server-sent frames with a monotonic
+	// sequence number; the next heartbeat must echo it back as seq_ack.
+	// Frames without `s` (older versions, or v8 frames that don't
+	// participate in the sequence) report 0 here, which we ignore so
+	// we don't reset to a lower value.
+	if e.Sequence > v.lastSeq {
+		v.lastSeq = e.Sequence
+	}
+
 	switch e.Operation {
 
 	case 2: // READY
@@ -498,10 +519,11 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		}
 		return
 
-	case 8: // HELLO (voice gateway v4+) — carries heartbeat_interval and
-		// is the protocol-mandated trigger to send IDENTIFY. v3 accepted
-		// identify-before-hello; v8 closes with code 4006 if we send
-		// identify before HELLO arrives.
+	case 8: // HELLO (voice gateway v4+) — carries heartbeat_interval.
+		// In voice gateway, IDENTIFY is sent immediately on connect
+		// (already done by Open before wsListen started), so OP8 just
+		// starts the heartbeat. NB: this differs from the MAIN gateway
+		// where HELLO is the trigger for IDENTIFY.
 		var hello struct {
 			HeartbeatInterval float64 `json:"heartbeat_interval"`
 		}
@@ -524,10 +546,6 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		}
 		v.log(LogInformational, "voice: starting heartbeat (interval=%vms)", ms)
 		go v.wsHeartbeat(v.wsConn, v.close, time.Duration(ms))
-		// Send IDENTIFY now that HELLO has been seen.
-		if err := v.sendVoiceIdentify(); err != nil {
-			v.log(LogError, "voice: identify after HELLO failed: %s", err)
-		}
 		return
 
 	case 5:
@@ -616,13 +634,35 @@ func (v *VoiceConnection) wsHeartbeat(wsConn *websocket.Conn, close <-chan struc
 		return
 	}
 
+	// v8 voice gateway requires the heartbeat payload to be a struct
+	// {"t": <nonce>, "seq_ack": <last_seq>}, NOT a bare integer. v3
+	// accepted the bare integer; v8 closes the connection with code
+	// 4006 ("session is no longer valid") about one heartbeat interval
+	// after the first non-conformant heartbeat. Sending the v8 shape
+	// is backwards-compatible — older servers either accept it or
+	// ignore the extra fields.
+	type v8HeartbeatData struct {
+		T      int64 `json:"t"`
+		SeqAck int64 `json:"seq_ack"`
+	}
+	type v8HeartbeatOp struct {
+		Op int             `json:"op"` // Always 3
+		D  v8HeartbeatData `json:"d"`
+	}
+
 	var err error
 	ticker := time.NewTicker(i * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		v.log(LogDebug, "sending heartbeat packet")
 		v.wsMutex.Lock()
-		err = wsConn.WriteJSON(voiceHeartbeatOp{3, int(time.Now().Unix())})
+		err = wsConn.WriteJSON(v8HeartbeatOp{
+			Op: 3,
+			D: v8HeartbeatData{
+				T:      time.Now().UnixNano(),
+				SeqAck: v.lastSeq,
+			},
+		})
 		v.wsMutex.Unlock()
 		if err != nil {
 			v.log(LogError, "error sending heartbeat to voice endpoint %s, %s", v.endpoint, err)
