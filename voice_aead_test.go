@@ -92,16 +92,17 @@ func makeAEADAESGCMPacket(t *testing.T, key *[32]byte, rtpHeader []byte, plainte
 	if err != nil {
 		t.Fatalf("cipher.NewGCM: %v", err)
 	}
+	// Match decrypt: counter goes in nonce[0:4] (NOT nonce[8:12]).
+	// AAD is the 12-byte fixed RTP header (no extension in this fixture).
+	// Trailing counter bytes preserve verbatim copy of nonce[0:4].
 	var nonce [12]byte
-	binary.BigEndian.PutUint32(nonce[8:], counter)
+	binary.LittleEndian.PutUint32(nonce[0:4], counter)
 
 	ciphertext := aead.Seal(nil, nonce[:], plaintext, rtpHeader)
 	packet := make([]byte, 0, len(rtpHeader)+len(ciphertext)+4)
 	packet = append(packet, rtpHeader...)
 	packet = append(packet, ciphertext...)
-	tail := make([]byte, 4)
-	binary.BigEndian.PutUint32(tail, counter)
-	packet = append(packet, tail...)
+	packet = append(packet, nonce[0:4]...)
 	return packet
 }
 
@@ -163,16 +164,15 @@ func makeAEADXChaChaPacket(t *testing.T, key *[32]byte, rtpHeader []byte, plaint
 	if err != nil {
 		t.Fatalf("chacha20poly1305.NewX: %v", err)
 	}
+	// Counter goes in nonce[0:4] for the rtpsize variant.
 	var nonce [chacha20poly1305.NonceSizeX]byte
-	binary.BigEndian.PutUint32(nonce[chacha20poly1305.NonceSizeX-4:], counter)
+	binary.LittleEndian.PutUint32(nonce[0:4], counter)
 
 	ciphertext := aead.Seal(nil, nonce[:], plaintext, rtpHeader)
 	packet := make([]byte, 0, len(rtpHeader)+len(ciphertext)+4)
 	packet = append(packet, rtpHeader...)
 	packet = append(packet, ciphertext...)
-	tail := make([]byte, 4)
-	binary.BigEndian.PutUint32(tail, counter)
-	packet = append(packet, tail...)
+	packet = append(packet, nonce[0:4]...)
 	return packet
 }
 

@@ -256,6 +256,11 @@ type VoiceSpeakingUpdate struct {
 type voiceOP4 struct {
 	SecretKey [32]byte `json:"secret_key"`
 	Mode      string   `json:"mode"`
+	// DAVEProtocolVersion is non-zero when the call is E2EE-active.
+	// Receiving op4 with version > 0 is the trigger for the client to
+	// send its MLS key package (opcode 26) proactively — Discord won't
+	// initiate the DAVE handshake otherwise.
+	DAVEProtocolVersion int `json:"dave_protocol_version"`
 }
 
 // A voiceOP2 stores the data for the voice operation 2 websocket event
@@ -508,14 +513,23 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		// add code to use this to track latency?
 		return
 
-	case 4: // udp encryption secret key
+	case 4: // udp encryption secret key (and DAVE protocol version)
 		v.Lock()
-		defer v.Unlock()
-
 		v.op4 = voiceOP4{}
 		if err := json.Unmarshal(e.RawData, &v.op4); err != nil {
+			v.Unlock()
 			v.log(LogError, "OP4 unmarshall error, %s, %s", err, string(e.RawData))
 			return
+		}
+		daveActive := v.op4.DAVEProtocolVersion > 0
+		v.Unlock()
+
+		// On a DAVE-eligible call we MUST proactively send our key
+		// package (op 26) — Discord won't initiate the MLS handshake
+		// otherwise. Init the DAVE state here (not lazily on op 24)
+		// and emit the key_package binary frame.
+		if daveActive {
+			v.activateDAVEFromOP4(uint16(v.op4.DAVEProtocolVersion))
 		}
 		return
 

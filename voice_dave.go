@@ -220,6 +220,34 @@ func (v *VoiceConnection) onDAVEExecuteTransition(raw json.RawMessage) {
 	// the next packet.
 }
 
+// activateDAVEFromOP4 is the OP4-driven DAVE bring-up. The voice gateway
+// signals DAVE is in effect for this call by setting dave_protocol_version
+// in OP4 (session description); when that field is non-zero the client
+// MUST proactively send its MLS key package to the gateway (opcode 26)
+// — Discord does not initiate the MLS handshake on its own.
+//
+// This duplicates some of onDAVEPrepareEpoch's lazy-init path but fires
+// EARLIER, before any OP21-31 traffic. If OP24 still arrives later, its
+// handler is a no-op now (state already populated).
+func (v *VoiceConnection) activateDAVEFromOP4(protocolVersion uint16) {
+	if v.dave == nil {
+		v.dave = v.newDAVEState(v.sessionID)
+	}
+	groupID, _ := strconv.ParseUint(v.ChannelID, 10, 64)
+	v.dave.session.Init(protocolVersion, groupID, v.UserID)
+	v.dave.setProtocolVersion(protocolVersion)
+
+	kp := v.dave.session.MarshalledKeyPackage()
+	if len(kp) == 0 {
+		v.log(LogError, "DAVE: session returned empty key package on OP4 init")
+		return
+	}
+	v.log(LogInformational, "DAVE: sending key package (op26) protocol=%d len=%d", protocolVersion, len(kp))
+	if err := v.sendDAVEBinaryFrame(daveKeyPackageFrame(kp)); err != nil {
+		v.log(LogError, "DAVE: failed to send key package: %s", err)
+	}
+}
+
 func (v *VoiceConnection) onDAVEPrepareEpoch(raw json.RawMessage) {
 	var p voiceDAVEPrepareEpoch
 	if err := json.Unmarshal(raw, &p); err != nil {
