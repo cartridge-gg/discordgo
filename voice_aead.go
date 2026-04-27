@@ -97,11 +97,72 @@ func decryptVoicePacket(mode string, packet []byte, key *[32]byte) ([]byte, erro
 	}
 }
 
-// decryptAEADAESGCMRTPSize implements AES-256-GCM with the 32-bit counter
-// at the end of the packet. AAD is the RTP header.
+// rtpAADEnd returns the byte offset where the AEAD ciphertext starts —
+// the AAD is the bytes BEFORE this offset, which for *_rtpsize Discord
+// modes is: 12-byte fixed RTP header + (4*CC) CSRC list + (4 bytes
+// extension preamble IF the X bit is set, NOT the extension payload).
+//
+// This is the subtle bit that took an hour of debugging:
+// "rtpsize" does NOT mean "full RTP header is AAD". The extension data
+// itself is encrypted along with the audio payload — only the 4-byte
+// extension preamble (defined-by-profile + length-in-words) is in the
+// clear and contributes to AAD. After decryption, the caller must skip
+// `4 * extLengthWords` bytes from the start of the plaintext to reach
+// the actual codec data.
+func rtpAADEnd(packet []byte) int {
+	const fixed = 12
+	if len(packet) < fixed {
+		return 0
+	}
+	cc := int(packet[0] & 0x0F)
+	plainLen := fixed + 4*cc
+	if (packet[0] & 0x10) != 0 {
+		plainLen += 4 // extension preamble only — payload stays encrypted
+	}
+	return plainLen
+}
+
+// rtpExtPayloadBytes returns the size in bytes of the (encrypted)
+// extension payload that the caller must strip from the decrypted
+// plaintext to reach the audio codec data. Returns 0 when there is no
+// extension. Must be called on the same packet that was decrypted.
+func rtpExtPayloadBytes(packet []byte) int {
+	if len(packet) < 12 {
+		return 0
+	}
+	if (packet[0] & 0x10) == 0 {
+		return 0
+	}
+	cc := int(packet[0] & 0x0F)
+	extPreambleAt := 12 + 4*cc
+	if len(packet) < extPreambleAt+4 {
+		return 0
+	}
+	return 4 * int(binary.BigEndian.Uint16(packet[extPreambleAt+2:extPreambleAt+4]))
+}
+
+// decryptAEADAESGCMRTPSize implements AES-256-GCM where:
+//   - the 32-bit nonce counter sits at the END of the packet (4 bytes)
+//   - that counter is copied to the FIRST 4 bytes of the 12-byte nonce
+//     (Discord's encoder uses LittleEndian.PutUint32 on nonce[0:4], and
+//      the counter byte ordering in the packet matches that, so a verbatim
+//      copy here is correct).
+//   - the AAD is the unencrypted RTP header bytes (fixed header + CSRCs
+//     + 4-byte extension preamble if X bit set), NOT the extension data.
+//   - the encrypted region is everything between AAD and the counter,
+//     including the extension payload (which the caller strips after
+//     decrypting).
+//   - the standard 16-byte AEAD tag is the last 16 bytes of the
+//     encrypted region (right before the counter).
+//
+// Reference: bwmarrin/discordgo PR #1704 voice.go opusReceiver.
 func decryptAEADAESGCMRTPSize(packet []byte, key *[32]byte) ([]byte, error) {
 	if len(packet) < 12+16+4 {
 		return nil, fmt.Errorf("packet too short for AES-GCM (%d)", len(packet))
+	}
+	aadEnd := rtpAADEnd(packet)
+	if aadEnd <= 0 || aadEnd > len(packet)-16-4 {
+		return nil, fmt.Errorf("invalid RTP AAD end (%d) for packet len %d", aadEnd, len(packet))
 	}
 	block, err := aes.NewCipher(key[:])
 	if err != nil {
@@ -112,24 +173,36 @@ func decryptAEADAESGCMRTPSize(packet []byte, key *[32]byte) ([]byte, error) {
 		return nil, fmt.Errorf("cipher.NewGCM: %w", err)
 	}
 
+	// Counter at the END of packet → FIRST 4 bytes of nonce. Verbatim
+	// byte copy preserves whatever endianness the encoder used.
 	var nonce [12]byte
-	copy(nonce[8:], packet[len(packet)-4:])
+	copy(nonce[:4], packet[len(packet)-4:])
 
-	aad := packet[:12]
-	ciphertext := packet[12 : len(packet)-4]
+	aad := packet[:aadEnd]
+	ciphertext := packet[aadEnd : len(packet)-4]
 
 	plaintext, err := aead.Open(nil, nonce[:], ciphertext, aad)
 	if err != nil {
 		return nil, fmt.Errorf("aes-gcm open: %w", err)
 	}
+	// Strip the now-decrypted extension payload — it sits at the start
+	// of the plaintext and is not part of the codec data.
+	if extBytes := rtpExtPayloadBytes(packet); extBytes > 0 && extBytes <= len(plaintext) {
+		plaintext = plaintext[extBytes:]
+	}
 	return plaintext, nil
 }
 
-// decryptAEADXChaChaPolyRTPSize implements XChaCha20-Poly1305 with the
-// 32-bit counter at the end of the packet. AAD is the RTP header.
+// decryptAEADXChaChaPolyRTPSize is the XChaCha20-Poly1305 sibling of
+// decryptAEADAESGCMRTPSize. Same AAD/ciphertext/nonce-position contract;
+// only the cipher and nonce length differ.
 func decryptAEADXChaChaPolyRTPSize(packet []byte, key *[32]byte) ([]byte, error) {
 	if len(packet) < 12+16+4 {
 		return nil, fmt.Errorf("packet too short for XChaCha20 (%d)", len(packet))
+	}
+	aadEnd := rtpAADEnd(packet)
+	if aadEnd <= 0 || aadEnd > len(packet)-16-4 {
+		return nil, fmt.Errorf("invalid RTP AAD end (%d) for packet len %d", aadEnd, len(packet))
 	}
 	aead, err := chacha20poly1305.NewX(key[:])
 	if err != nil {
@@ -137,14 +210,17 @@ func decryptAEADXChaChaPolyRTPSize(packet []byte, key *[32]byte) ([]byte, error)
 	}
 
 	var nonce [chacha20poly1305.NonceSizeX]byte
-	copy(nonce[chacha20poly1305.NonceSizeX-4:], packet[len(packet)-4:])
+	copy(nonce[:4], packet[len(packet)-4:])
 
-	aad := packet[:12]
-	ciphertext := packet[12 : len(packet)-4]
+	aad := packet[:aadEnd]
+	ciphertext := packet[aadEnd : len(packet)-4]
 
 	plaintext, err := aead.Open(nil, nonce[:], ciphertext, aad)
 	if err != nil {
 		return nil, fmt.Errorf("xchacha20-poly1305 open: %w", err)
+	}
+	if extBytes := rtpExtPayloadBytes(packet); extBytes > 0 && extBytes <= len(plaintext) {
+		plaintext = plaintext[extBytes:]
 	}
 	return plaintext, nil
 }

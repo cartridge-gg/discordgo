@@ -583,6 +583,12 @@ func (v *VoiceConnection) onEvent(message []byte) {
 // has sent HELLO (op 8). Sending IDENTIFY before HELLO results in a
 // close-code 4006 ("Session is no longer valid"). The OP8 handler in
 // onEvent invokes this; Open() must NOT call it directly.
+// sendVoiceIdentify writes the voice-gateway IDENTIFY (op 0) frame.
+// CALLER MUST hold v.Lock() — this function reads VoiceConnection fields
+// without taking its own lock to avoid a self-deadlock with open(), which
+// is the only caller and which holds v.Lock() across the websocket Dial.
+// Taking v.RLock() here would block forever waiting for the write lock
+// open() owns.
 func (v *VoiceConnection) sendVoiceIdentify() error {
 	type voiceHandshakeData struct {
 		ServerID               string `json:"server_id"`
@@ -595,26 +601,19 @@ func (v *VoiceConnection) sendVoiceIdentify() error {
 		Op   int                `json:"op"` // Always 0
 		Data voiceHandshakeData `json:"d"`
 	}
-	v.RLock()
-	wsConn := v.wsConn
-	guildID := v.GuildID
-	userID := v.UserID
-	sessionID := v.sessionID
-	token := v.token
-	v.RUnlock()
-	if wsConn == nil {
+	if v.wsConn == nil {
 		return fmt.Errorf("no voice websocket")
 	}
 	data := voiceHandshakeOp{0, voiceHandshakeData{
-		ServerID:               guildID,
-		UserID:                 userID,
-		SessionID:              sessionID,
-		Token:                  token,
+		ServerID:               v.GuildID,
+		UserID:                 v.UserID,
+		SessionID:              v.sessionID,
+		Token:                  v.token,
 		MaxDAVEProtocolVersion: dave.MaxSupportedProtocolVersion(),
 	}}
 	v.wsMutex.Lock()
 	defer v.wsMutex.Unlock()
-	return wsConn.WriteJSON(data)
+	return v.wsConn.WriteJSON(data)
 }
 
 type voiceHeartbeatOp struct {
@@ -1017,11 +1016,15 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			}
 		}
 
-		// extension bit set, and not a RTCP packet
-		if ((recvbuf[0] & 0x10) == 0x10) && ((recvbuf[1] & 0x80) == 0) {
-			// get extended header length
+		// extension bit set, and not a RTCP packet. The legacy
+		// xsalsa20_poly1305 path encrypts the extension preamble +
+		// payload together, so the decrypted plaintext starts with
+		// the extension. AEAD-rtpsize paths already stripped the
+		// extension inside decryptVoicePacket, so we skip this on
+		// those modes.
+		if !voiceModeUsesAEAD(v.op4.Mode) &&
+			((recvbuf[0] & 0x10) == 0x10) && ((recvbuf[1] & 0x80) == 0) {
 			extlen := binary.BigEndian.Uint16(p.Opus[2:4])
-			// 4 bytes (ext header header) + 4*extlen (ext header data)
 			shift := int(4 + 4*extlen)
 			if len(p.Opus) > shift {
 				p.Opus = p.Opus[shift:]
