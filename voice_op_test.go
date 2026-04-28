@@ -185,9 +185,12 @@ func TestVoiceOnEventOP5_FiresHandler(t *testing.T) {
 		got = vs
 	})
 
+	// Discord sends speaking as an int bitmask (1=mic, 2=soundshare,
+	// 4=priority); VoiceSpeakingUpdate.UnmarshalJSON coerces non-zero
+	// to true so existing bool consumers keep working.
 	raw := []byte(`{
 		"op": 5,
-		"d": { "user_id": "999", "ssrc": 4242, "speaking": true }
+		"d": { "user_id": "999", "ssrc": 4242, "speaking": 1 }
 	}`)
 	v.onEvent(raw)
 
@@ -209,7 +212,7 @@ func TestVoiceOnEventOP5_BookkeepingWhenDAVEInactive(t *testing.T) {
 	v.AddHandler(func(_ *VoiceConnection, _ *VoiceSpeakingUpdate) { called = true })
 	raw := []byte(`{
 		"op": 5,
-		"d": { "user_id": "999", "ssrc": 4242, "speaking": true }
+		"d": { "user_id": "999", "ssrc": 4242, "speaking": 1 }
 	}`)
 	defer func() {
 		if r := recover(); r != nil {

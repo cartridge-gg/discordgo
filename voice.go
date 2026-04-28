@@ -241,10 +241,51 @@ func (v *VoiceConnection) AddHandler(h VoiceSpeakingUpdateHandler) {
 }
 
 // VoiceSpeakingUpdate is a struct for a VoiceSpeakingUpdate event.
+//
+// On the wire, Discord's `speaking` field is actually a uint8 bitmask
+// (1=microphone, 2=soundshare, 4=priority) — not the bool the upstream
+// type implies. v8 / DAVE rollout sends `1` / `2` / etc. directly,
+// which makes the bool unmarshal hard-fail and silently drops every
+// OP5 event. The custom UnmarshalJSON below accepts both wire forms
+// (`true` / `false` from the legacy gateway, and integers from v8) so
+// existing consumers can keep treating `Speaking` as a boolean
+// "user is making sound" signal.
 type VoiceSpeakingUpdate struct {
 	UserID   string `json:"user_id"`
 	SSRC     int    `json:"ssrc"`
 	Speaking bool   `json:"speaking"`
+}
+
+// UnmarshalJSON accepts Discord's int-bitmask `speaking` field and
+// coerces it to bool (any non-zero value → true). Falls back to the
+// stdlib decoder for the legacy bool form.
+func (v *VoiceSpeakingUpdate) UnmarshalJSON(data []byte) error {
+	type alias VoiceSpeakingUpdate
+	aux := &struct {
+		Speaking json.RawMessage `json:"speaking"`
+		*alias
+	}{alias: (*alias)(v)}
+	if err := json.Unmarshal(data, aux); err != nil {
+		return err
+	}
+	if len(aux.Speaking) == 0 {
+		return nil
+	}
+	// Try bool first (legacy wire form).
+	var b bool
+	if err := json.Unmarshal(aux.Speaking, &b); err == nil {
+		v.Speaking = b
+		return nil
+	}
+	// Fall back to int bitmask: any non-zero bit means audio is being
+	// produced (speaking, soundshare, or priority — caller doesn't care
+	// which for our purposes).
+	var n int
+	if err := json.Unmarshal(aux.Speaking, &n); err != nil {
+		return fmt.Errorf("VoiceSpeakingUpdate.speaking: %w", err)
+	}
+	v.Speaking = n != 0
+	return nil
 }
 
 // ------------------------------------------------------------------------------------------------

@@ -220,32 +220,47 @@ func (v *VoiceConnection) onDAVEExecuteTransition(raw json.RawMessage) {
 	// the next packet.
 }
 
-// activateDAVEFromOP4 is the OP4-driven DAVE bring-up. The voice gateway
-// signals DAVE is in effect for this call by setting dave_protocol_version
-// in OP4 (session description); when that field is non-zero the client
-// MUST proactively send its MLS key package to the gateway (opcode 26)
-// — Discord does not initiate the MLS handshake on its own.
-//
-// This duplicates some of onDAVEPrepareEpoch's lazy-init path but fires
-// EARLIER, before any OP21-31 traffic. If OP24 still arrives later, its
-// handler is a no-op now (state already populated).
-func (v *VoiceConnection) activateDAVEFromOP4(protocolVersion uint16) {
-	if v.dave == nil {
-		v.dave = v.newDAVEState(v.sessionID)
+// ensureDAVEState lazy-creates v.dave + initializes the libdave session.
+// Idempotent and serialized via v.Lock so concurrent OP4 / op25 handlers
+// don't both call session.Init (which RESETS libdave state — second
+// caller wipes the first caller's pending group + leaf node).
+func (v *VoiceConnection) ensureDAVEState(protocolVersion uint16) (created bool) {
+	v.Lock()
+	defer v.Unlock()
+	if v.dave != nil {
+		return false
 	}
+	// authSessionID="" → libdave skips its persisted-key lookup and
+	// generates a fresh ephemeral MLS signature key (session.cpp:597-599).
+	// Passing v.sessionID makes signingKeyId_ non-empty, which forces the
+	// GetPersistedKeyPair path; that fails because the Linux generic
+	// implementation needs a writable key-storage dir and we don't ship
+	// one. Result was: no leaf node, empty key package, op26 never sent,
+	// MLS handshake never starts. Ephemeral keys are fine — each voice
+	// connection is a fresh MLS group regardless.
+	v.dave = v.newDAVEState("")
 	groupID, _ := strconv.ParseUint(v.ChannelID, 10, 64)
 	v.dave.session.Init(protocolVersion, groupID, v.UserID)
 	v.dave.setProtocolVersion(protocolVersion)
+	return true
+}
 
-	kp := v.dave.session.MarshalledKeyPackage()
-	if len(kp) == 0 {
-		v.log(LogError, "DAVE: session returned empty key package on OP4 init")
-		return
-	}
-	v.log(LogInformational, "DAVE: sending key package (op26) protocol=%d len=%d", protocolVersion, len(kp))
-	if err := v.sendDAVEBinaryFrame(daveKeyPackageFrame(kp)); err != nil {
-		v.log(LogError, "DAVE: failed to send key package: %s", err)
-	}
+// activateDAVEFromOP4 records the negotiated DAVE protocol version on the
+// daveState. It also lazy-allocates the daveState + libdave session if
+// they don't exist yet (OP4 may arrive before or after op25).
+//
+// What it intentionally does NOT do: marshal a key package or send op26.
+// libdave can only produce a valid key package AFTER receiving op25
+// (external_sender_package), which Discord sends on its own — usually
+// before OP4. The op26 send lives in onDAVEExternalSenderPackage, where
+// it has the data libdave needs.
+func (v *VoiceConnection) activateDAVEFromOP4(protocolVersion uint16) {
+	v.ensureDAVEState(protocolVersion)
+	// If op25 lazy-inited with the default version (1) and OP4 reports
+	// something different, update. setProtocolVersion is cheap + holds
+	// daveState.mu, no v.Lock needed.
+	v.dave.setProtocolVersion(protocolVersion)
+	v.log(LogInformational, "DAVE: OP4 protocol_version=%d (awaiting op25 external_sender)", protocolVersion)
 }
 
 func (v *VoiceConnection) onDAVEPrepareEpoch(raw json.RawMessage) {
@@ -280,11 +295,16 @@ func (v *VoiceConnection) handleDAVEBinaryFrame(frame []byte) {
 	}
 	v.log(LogDebug, "DAVE binary op=%d seq=%d len=%d", op, seq, len(payload))
 
-	if v.dave == nil {
-		// Binary DAVE frames should only arrive after opcode 24 has set up
-		// the session. If we see one first, log and drop.
-		v.log(LogWarning, "DAVE binary op %d received before session init; dropping", op)
-		return
+	// Discord sends op25 (external_sender_package) BEFORE op4 in practice
+	// — that's the trigger for the DAVE handshake, not a post-init
+	// message. Lazy-init with protocol version 1 (the only version
+	// libdave supports today); op4's setProtocolVersion will update if
+	// Discord advertises something else. Without this, op25 gets dropped
+	// and libdave never gets the leaf node it needs to produce a key
+	// package, so the MLS handshake stalls and inner-DAVE decrypt never
+	// comes online.
+	if v.ensureDAVEState(1) {
+		v.log(LogInformational, "DAVE: lazy-init on first binary frame op=%d", op)
 	}
 
 	switch op {
@@ -306,6 +326,7 @@ func (v *VoiceConnection) onDAVEExternalSenderPackage(payload []byte) {
 		return
 	}
 	v.dave.session.SetExternalSender(payload)
+	v.log(LogInformational, "DAVE: op25 SetExternalSender done (len=%d)", len(payload))
 
 	// The client responds to opcode 25 with its own opcode 26 (key package).
 	kp := v.dave.session.MarshalledKeyPackage()
@@ -315,7 +336,9 @@ func (v *VoiceConnection) onDAVEExternalSenderPackage(payload []byte) {
 	}
 	if err := v.sendDAVEBinaryFrame(daveKeyPackageFrame(kp)); err != nil {
 		v.log(LogError, "DAVE: failed to send key package: %s", err)
+		return
 	}
+	v.log(LogInformational, "DAVE: op26 key_package SENT (len=%d)", len(kp))
 }
 
 func (v *VoiceConnection) onDAVEProposals(payload []byte) {
@@ -434,27 +457,49 @@ func (v *VoiceConnection) sendDAVEBinaryFrame(frame []byte) error {
 	return v.wsConn.WriteMessage(websocket.BinaryMessage, frame)
 }
 
-// daveRecognizedUserIDs returns the set of user IDs our client has seen via
-// VoiceStateUpdate or VoiceSpeakingUpdate. libdave uses this list to decide
-// whether to accept proposals and welcomes. For now we return just the local
-// user ID plus any SSRC-observed userIDs; a fuller implementation tracks the
-// guild voice state roster.
+// daveRecognizedUserIDs returns the set of user IDs libdave should accept
+// in MLS proposals + welcomes. The list is the trust anchor for MLS group
+// membership: if Discord (the external sender) proposes adding a user
+// outside this set, libdave rejects with "Unexpected user ID in add
+// proposal" and the handshake stalls.
+//
+// Sources, in priority order:
+//  1. Session state's voice-state cache for the guild — every user
+//     currently in *any* voice channel of this guild. We don't filter to
+//     the bot's channel because op27 can land before VOICE_STATE_UPDATE
+//     events have fully populated, and Discord only proposes adding
+//     users in our channel anyway.
+//  2. Our own user ID + any SSRC-observed user IDs from completed
+//     decryptors / ratchets, as a fallback if state caching is off.
 func (v *VoiceConnection) daveRecognizedUserIDs() []string {
-	if v.dave == nil {
-		return []string{v.UserID}
-	}
-	v.dave.mu.Lock()
-	defer v.dave.mu.Unlock()
-
 	seen := map[string]struct{}{v.UserID: {}}
-	for _, s := range v.dave.decryptors {
-		if s.userID != "" {
-			seen[s.userID] = struct{}{}
+
+	// Session state may be nil/empty if the consumer disabled state
+	// tracking. Best-effort lookup; never block the DAVE handshake on
+	// state being present.
+	if v.session != nil && v.session.State != nil && v.GuildID != "" {
+		if g, err := v.session.State.Guild(v.GuildID); err == nil && g != nil {
+			for _, vs := range g.VoiceStates {
+				if vs != nil && vs.UserID != "" {
+					seen[vs.UserID] = struct{}{}
+				}
+			}
 		}
 	}
-	for uid := range v.dave.ratchets {
-		seen[uid] = struct{}{}
+
+	if v.dave != nil {
+		v.dave.mu.Lock()
+		for _, s := range v.dave.decryptors {
+			if s.userID != "" {
+				seen[s.userID] = struct{}{}
+			}
+		}
+		for uid := range v.dave.ratchets {
+			seen[uid] = struct{}{}
+		}
+		v.dave.mu.Unlock()
 	}
+
 	out := make([]string, 0, len(seen))
 	for uid := range seen {
 		out = append(out, uid)
