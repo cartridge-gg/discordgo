@@ -272,16 +272,16 @@ func (v *VoiceConnection) onDAVEPrepareEpoch(raw json.RawMessage) {
 	v.log(LogInformational, "DAVE op24 prepare_epoch version=%d epoch=%d",
 		p.ProtocolVersion, p.Epoch)
 
-	if v.dave == nil {
-		v.dave = v.newDAVEState(v.sessionID)
-	}
-
-	// Epoch=1 signals a new MLS group. Initialise the libdave session with
-	// the negotiated protocol version and our snowflake ID.
-	if p.Epoch == 1 {
-		groupID, _ := strconv.ParseUint(v.ChannelID, 10, 64)
-		v.dave.session.Init(p.ProtocolVersion, groupID, v.UserID)
-	}
+	// ensureDAVEState is idempotent — covers the case where OP24 is the
+	// first DAVE-related event we see (rare, but possible). When the
+	// state was already created via op25's lazy-init OR via OP4, this
+	// is a no-op. Critically, we DO NOT call session.Init again here:
+	// libdave's Init resets MLS state, which would wipe the leaf node
+	// + group membership we got from a prior op30 welcome. Discord
+	// drives epoch transitions via op27/op28 (proposals + commits) and
+	// op29/op30 (announces + welcomes); OP24 is purely informational
+	// and just carries the protocol version + epoch number.
+	v.ensureDAVEState(p.ProtocolVersion)
 	v.dave.setProtocolVersion(p.ProtocolVersion)
 }
 
