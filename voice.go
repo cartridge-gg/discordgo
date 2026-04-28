@@ -69,6 +69,16 @@ type VoiceConnection struct {
 
 	voiceSpeakingUpdateHandlers []VoiceSpeakingUpdateHandler
 
+	// ssrcUserIDs maps SSRC → user ID, populated by OP5 SPEAKING events.
+	// This exists so consumers (e.g. a demux that buffers packets per
+	// SSRC) can resolve the speaker for an SSRC even if their own OP5
+	// handler was registered too late to catch the initial Speaking=true
+	// (a common race when handler registration runs after a multi-second
+	// REST setup like creating a transcript thread). Always populated,
+	// regardless of whether DAVE is active. Read via SSRCUserID.
+	ssrcUserIDsMu sync.Mutex
+	ssrcUserIDs   map[uint32]string
+
 	// lastSeq is the highest sequence number we've seen on a server-sent
 	// frame. Voice gateway v8 stamps every server message with a `s`
 	// field and expects clients to echo the latest in heartbeat payloads
@@ -238,6 +248,22 @@ func (v *VoiceConnection) AddHandler(h VoiceSpeakingUpdateHandler) {
 	defer v.Unlock()
 
 	v.voiceSpeakingUpdateHandlers = append(v.voiceSpeakingUpdateHandlers, h)
+}
+
+// SSRCUserID returns the user ID associated with the given SSRC, or "" if
+// no SPEAKING event for that SSRC has been observed yet. The mapping is
+// populated unconditionally on every OP5 SPEAKING event (regardless of
+// whether DAVE is active or whether the consumer has registered a
+// VoiceSpeakingUpdate handler), so a demux can resolve a speaker by SSRC
+// even if it missed the initial Speaking=true event due to handler
+// registration timing.
+func (v *VoiceConnection) SSRCUserID(ssrc uint32) string {
+	v.ssrcUserIDsMu.Lock()
+	defer v.ssrcUserIDsMu.Unlock()
+	if v.ssrcUserIDs == nil {
+		return ""
+	}
+	return v.ssrcUserIDs[ssrc]
 }
 
 // VoiceSpeakingUpdate is a struct for a VoiceSpeakingUpdate event.
@@ -616,6 +642,18 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		if err := json.Unmarshal(e.RawData, voiceSpeakingUpdate); err != nil {
 			v.log(LogError, "OP5 unmarshall error, %s, %s", err, string(e.RawData))
 			return
+		}
+
+		// Record the SSRC → userID mapping unconditionally so consumers
+		// can resolve a speaker by SSRC via SSRCUserID even if their own
+		// OP5 handler was registered after this event fired.
+		if voiceSpeakingUpdate.UserID != "" && voiceSpeakingUpdate.SSRC != 0 {
+			v.ssrcUserIDsMu.Lock()
+			if v.ssrcUserIDs == nil {
+				v.ssrcUserIDs = make(map[uint32]string)
+			}
+			v.ssrcUserIDs[uint32(voiceSpeakingUpdate.SSRC)] = voiceSpeakingUpdate.UserID
+			v.ssrcUserIDsMu.Unlock()
 		}
 
 		for _, h := range v.voiceSpeakingUpdateHandlers {
