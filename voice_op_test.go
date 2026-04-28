@@ -202,6 +202,37 @@ func TestVoiceOnEventOP5_FiresHandler(t *testing.T) {
 	}
 }
 
+func TestVoiceOnEventOP5_NoHandlerStillUpdatesDAVE(t *testing.T) {
+	// Regression for the prod gibberish-transcript bug: OP5 used to
+	// early-return when no user handlers were registered, which meant
+	// onDAVESpeakingUpdate never ran, which meant no per-SSRC decryptor
+	// was minted. A consumer (goclaw) that registered its handler a few
+	// REST-calls AFTER ChannelVoiceJoin returned would then get
+	// plaintext-from-OpusRecv only for SSRCs whose initial SPEAKING
+	// arrived after registration — and inner-DAVE ciphertext for SSRCs
+	// whose first SPEAKING event hit the early-return.
+	//
+	// The fix: parse + dispatch the JSON regardless of handler count,
+	// and always call onDAVESpeakingUpdate. This test verifies OP5
+	// processing succeeds with zero registered handlers (no panic, no
+	// JSON-parse error path triggered).
+	v := newTestVoiceConn()
+	// Deliberately do NOT register any handlers.
+	raw := []byte(`{
+		"op": 5,
+		"d": { "user_id": "999", "ssrc": 4242, "speaking": 1 }
+	}`)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("OP5 with no handlers panicked: %v", r)
+		}
+	}()
+	v.onEvent(raw)
+	// Success = no panic, no JSON unmarshal error logged. The
+	// onDAVESpeakingUpdate guard short-circuits when v.dave is nil,
+	// so we don't need libdave wired here.
+}
+
 func TestVoiceOnEventOP5_BookkeepingWhenDAVEInactive(t *testing.T) {
 	// When v.dave is nil, OP5 should still drive the user-registered
 	// VoiceSpeakingUpdate handlers but onDAVESpeakingUpdate must

@@ -604,10 +604,14 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		return
 
 	case 5:
-		if len(v.voiceSpeakingUpdateHandlers) == 0 {
-			return
-		}
-
+		// Always parse OP5 — onDAVESpeakingUpdate below mints the per-SSRC
+		// DAVE decryptor, which is required for inner-DAVE decrypt to work
+		// regardless of whether userspace registered a VoiceSpeakingUpdate
+		// handler. A consumer (e.g. goclaw) that races OP5 vs handler
+		// registration would otherwise see plaintext-from-OpusRecv only
+		// for SPEAKING events that arrive AFTER its handler is wired,
+		// and ciphertext-leaking-as-plaintext for SSRCs whose initial
+		// SPEAKING was dropped here.
 		voiceSpeakingUpdate := &VoiceSpeakingUpdate{}
 		if err := json.Unmarshal(e.RawData, voiceSpeakingUpdate); err != nil {
 			v.log(LogError, "OP5 unmarshall error, %s, %s", err, string(e.RawData))
