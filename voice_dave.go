@@ -153,21 +153,29 @@ func (d *daveState) installRatchetForUser(userID string, kr *dave.KeyRatchet) {
 // refreshRatchetsForRoster queries libdave for a fresh KeyRatchet per roster
 // member and applies them to their bound decryptors. Called after ProcessCommit
 // or ProcessWelcome when the MLS epoch changes.
-func (d *daveState) refreshRatchetsForRoster(rosterMemberIDs []uint64) {
+//
+// Returns (installed, missing). Missing > 0 is the smoking gun for
+// "speaker X gets transcribed, speaker Y doesn't" — we have a ratchet
+// for one roster member and not another. The caller should log this
+// at Info so prod is observable; daveState doesn't hold a logger.
+func (d *daveState) refreshRatchetsForRoster(rosterMemberIDs []uint64) (installed, missing int) {
 	d.mu.Lock()
 	sess := d.session
 	d.mu.Unlock()
 	if sess == nil {
-		return
+		return 0, 0
 	}
 	for _, id := range rosterMemberIDs {
 		userID := strconv.FormatUint(id, 10)
 		kr := sess.GetKeyRatchet(userID)
 		if kr == nil {
+			missing++
 			continue
 		}
 		d.installRatchetForUser(userID, kr)
+		installed++
 	}
+	return installed, missing
 }
 
 // handleDAVEJSONEvent dispatches the JSON-encoded DAVE opcodes (21, 22, 24,
@@ -293,7 +301,7 @@ func (v *VoiceConnection) handleDAVEBinaryFrame(frame []byte) {
 		v.log(LogError, "DAVE binary frame: %s", err)
 		return
 	}
-	v.log(LogDebug, "DAVE binary op=%d seq=%d len=%d", op, seq, len(payload))
+	v.log(LogInformational, "DAVE binary op=%d seq=%d len=%d", op, seq, len(payload))
 
 	// Discord sends op25 (external_sender_package) BEFORE op4 in practice
 	// — that's the trigger for the DAVE handshake, not a post-init
@@ -346,12 +354,20 @@ func (v *VoiceConnection) onDAVEProposals(payload []byte) {
 		return
 	}
 	recognized := v.daveRecognizedUserIDs()
+	v.log(LogInformational, "DAVE: op27 ProcessProposals (payload_len=%d, recognized_users=%d)", len(payload), len(recognized))
 	commitWelcome := v.dave.session.ProcessProposals(payload, recognized)
 	if len(commitWelcome) == 0 {
 		// Empty result means no commit was produced — either all proposals
-		// were revoke-only or libdave rejected them. Nothing to send.
+		// were revoke-only or libdave rejected them. Without sending op28
+		// back, Discord won't progress the group state, so subsequent
+		// speakers' frames stay at an epoch we don't have keys for and
+		// silently fail to decrypt downstream. Visible in libdave logs as
+		// "Decrypt failed, no valid cryptor found, ... number of cryptor
+		// managers: 1, pass through enabled: no".
+		v.log(LogWarning, "DAVE: op27 ProcessProposals produced empty commit/welcome — group will not advance")
 		return
 	}
+	v.log(LogInformational, "DAVE: op27 → op28 commit/welcome SENDING (len=%d)", len(commitWelcome))
 	if err := v.sendDAVEBinaryFrame(daveCommitWelcomeFrame(commitWelcome)); err != nil {
 		v.log(LogError, "DAVE: failed to send commit/welcome: %s", err)
 	}
@@ -367,21 +383,24 @@ func (v *VoiceConnection) onDAVEAnnounceCommitTransition(payload []byte) {
 
 	result := v.dave.session.ProcessCommit(commitBytes)
 	if result == nil {
-		v.log(LogError, "DAVE: ProcessCommit returned nil for transition_id=%d", transitionID)
+		v.log(LogError, "DAVE: op29 ProcessCommit returned nil for transition_id=%d", transitionID)
 		v.sendDAVEInvalidCommitWelcome(transitionID)
 		return
 	}
 	defer result.Close()
 
 	if result.Failed() {
-		v.log(LogError, "DAVE: commit failed for transition_id=%d", transitionID)
+		v.log(LogError, "DAVE: op29 commit FAILED for transition_id=%d", transitionID)
 		v.sendDAVEInvalidCommitWelcome(transitionID)
 		return
 	}
 	if result.Ignored() {
-		v.log(LogDebug, "DAVE: commit ignored for transition_id=%d", transitionID)
+		v.log(LogInformational, "DAVE: op29 commit IGNORED for transition_id=%d", transitionID)
 	} else {
-		v.dave.refreshRatchetsForRoster(result.RosterMemberIDs())
+		roster := result.RosterMemberIDs()
+		installed, missing := v.dave.refreshRatchetsForRoster(roster)
+		v.log(LogInformational, "DAVE: op29 commit applied transition_id=%d roster=%d ratchets_installed=%d ratchets_missing=%d",
+			transitionID, len(roster), installed, missing)
 	}
 	v.sendDAVEReadyForTransition(transitionID)
 }
@@ -397,13 +416,16 @@ func (v *VoiceConnection) onDAVEWelcome(payload []byte) {
 	recognized := v.daveRecognizedUserIDs()
 	result := v.dave.session.ProcessWelcome(welcomeBytes, recognized)
 	if result == nil {
-		v.log(LogError, "DAVE: ProcessWelcome returned nil for transition_id=%d", transitionID)
+		v.log(LogError, "DAVE: op30 ProcessWelcome returned nil for transition_id=%d (recognized=%d)", transitionID, len(recognized))
 		v.sendDAVEInvalidCommitWelcome(transitionID)
 		return
 	}
 	defer result.Close()
 
-	v.dave.refreshRatchetsForRoster(result.RosterMemberIDs())
+	roster := result.RosterMemberIDs()
+	installed, missing := v.dave.refreshRatchetsForRoster(roster)
+	v.log(LogInformational, "DAVE: op30 welcome applied transition_id=%d roster=%d ratchets_installed=%d ratchets_missing=%d",
+		transitionID, len(roster), installed, missing)
 	v.sendDAVEReadyForTransition(transitionID)
 }
 
