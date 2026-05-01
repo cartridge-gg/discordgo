@@ -50,11 +50,18 @@ type ssrcStat struct {
 func main() {
 	verbose := flag.Bool("verbose", true, "log every dispatched event")
 	outDir := flag.String("out", "/tmp/voicedebug-out", "directory to dump per-SSRC raw opus files")
+	utterDir := flag.String("utterances", "", "directory to dump one OGG OPUS file per detected utterance (default: <out>/utterances)")
+	sttKey := flag.String("stt-elevenlabs", os.Getenv("ELEVENLABS_API_KEY"),
+		"if set, POST each utterance to ElevenLabs Scribe and print the transcript to stdout. Defaults to $ELEVENLABS_API_KEY.")
+	sttLang := flag.String("stt-language", "", "ISO 639-1 language hint passed to ElevenLabs (e.g. 'en'). Empty = auto-detect.")
 	handlerDelay := flag.Duration("handler-delay", 0,
 		"sleep this long between ChannelVoiceJoin returning and registering the "+
 			"VoiceSpeakingUpdate handler. Simulates goclaw's onJoinSuccess REST window "+
 			"to repro the OP5-drop race the dave.16 fix targets.")
 	flag.Parse()
+	if *utterDir == "" {
+		*utterDir = filepath.Join(*outDir, "utterances")
+	}
 
 	token := os.Getenv("DISCORD_TOKEN")
 	guildID := os.Getenv("GUILD_ID")
@@ -118,15 +125,113 @@ func main() {
 		fmt.Printf(">>> simulating goclaw REST window: delaying VoiceSpeakingUpdate handler registration by %s\n", *handlerDelay)
 		time.Sleep(*handlerDelay)
 	}
+	// Display name resolver — caches GuildMember lookups so we don't hit
+	// Discord's REST API once per utterance for the same user.
+	var nameMu sync.Mutex
+	nameCache := map[string]string{}
+	resolveName := func(userID string) string {
+		nameMu.Lock()
+		if n, ok := nameCache[userID]; ok {
+			nameMu.Unlock()
+			return n
+		}
+		nameMu.Unlock()
+		gm, gerr := dg.GuildMember(guildID, userID)
+		name := userID
+		if gerr == nil && gm != nil {
+			switch {
+			case gm.Nick != "":
+				name = gm.Nick
+			case gm.User != nil && gm.User.GlobalName != "":
+				name = gm.User.GlobalName
+			case gm.User != nil:
+				name = gm.User.Username
+			}
+		}
+		nameMu.Lock()
+		nameCache[userID] = name
+		nameMu.Unlock()
+		return name
+	}
+
+	stt := newSTTManager(*sttKey, *sttLang, *utterDir, resolveName,
+		func(format string, args ...any) { fmt.Printf(format+"\n", args...) })
+	if *sttKey != "" {
+		fmt.Printf(">>> STT enabled: ElevenLabs Scribe; utterances → %s\n", *utterDir)
+	} else {
+		fmt.Printf(">>> STT disabled (no --stt-elevenlabs / $ELEVENLABS_API_KEY); utterances → %s\n", *utterDir)
+	}
+
 	vc.AddHandler(func(_ *discordgo.VoiceConnection, vsu *discordgo.VoiceSpeakingUpdate) {
-		fmt.Printf(">>> VoiceSpeakingUpdate user=%s ssrc=%d speaking=%v\n",
-			vsu.UserID, vsu.SSRC, vsu.Speaking)
+		if *verbose {
+			fmt.Printf(">>> VoiceSpeakingUpdate user=%s ssrc=%d speaking=%v\n",
+				vsu.UserID, vsu.SSRC, vsu.Speaking)
+		}
+		ssrc := uint32(vsu.SSRC)
+		if vsu.UserID != "" {
+			stt.NoteSpeaker(ssrc, vsu.UserID)
+		}
+		if !vsu.Speaking {
+			stt.FlushSSRC(ssrc, "speaking_false")
+		}
 	})
+
+	// Ceiling watchdog — gap-flush at 1.5s silence, force-flush at 10s.
+	stopCeiling := make(chan struct{})
+	go func() {
+		t := time.NewTicker(200 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopCeiling:
+				return
+			case now := <-t.C:
+				stt.CeilingTick(now)
+			}
+		}
+	}()
 
 	stats := struct {
 		mu sync.Mutex
 		m  map[uint32]*ssrcStat
 	}{m: make(map[uint32]*ssrcStat)}
+
+	// DAVE handshake watchdog — detects stuck handshakes (op26 sent but
+	// no op30) and partial-roster failures (op30 with ratchets_missing > 0)
+	// and applies the resend / soft-reset recovery policy.
+	//
+	// "human in channel" is sourced from discordgo's State, which tracks
+	// VoiceStateUpdate events Discord pushes via the main gateway. We
+	// count voice-state entries whose ChannelID matches ours and whose
+	// UserID isn't the bot. This works whether the human joined before
+	// or after the bot, and doesn't depend on them having spoken yet
+	// (the original SSRC-based heuristic was chicken-and-egg: SSRC only
+	// appears the moment the handshake completes, so the watchdog could
+	// never fire pre-handshake).
+	botID := dg.State.User.ID
+	humansActive := func() bool {
+		g, err := dg.State.Guild(guildID)
+		if err != nil || g == nil {
+			return false
+		}
+		for _, vs := range g.VoiceStates {
+			if vs == nil {
+				continue
+			}
+			if vs.ChannelID != channelID {
+				continue
+			}
+			if vs.UserID == botID {
+				continue
+			}
+			return true
+		}
+		return false
+	}
+	wd := newDAVEWatchdog(vc, humansActive,
+		func(format string, args ...any) { fmt.Printf(format+"\n", args...) })
+	stopWatchdog := make(chan struct{})
+	go wd.Run(stopWatchdog)
 
 	getOrCreate := func(ssrc uint32) *ssrcStat {
 		stats.mu.Lock()
@@ -166,6 +271,7 @@ func main() {
 				_, _ = s.file.Write(p.Opus)
 			}
 			s.mu.Unlock()
+			stt.Append(p.SSRC, p.Opus)
 		}
 	}()
 
@@ -217,13 +323,20 @@ func main() {
 				s.mu.Unlock()
 			}
 			stats.mu.Unlock()
+			fmt.Printf("|| %s\n", formatHealth(vc.DAVEHealth(), time.Now()))
 		}
 	}()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
-	fmt.Println("\n>>> shutdown signal; disconnecting voice + gateway")
+	fmt.Println("\n>>> shutdown signal; flushing in-flight utterances")
+	close(stopCeiling)
+	close(stopWatchdog)
+	stt.FlushAll("shutdown")
+	// Give in-flight goroutines a moment to finish their POSTs.
+	time.Sleep(2 * time.Second)
+	fmt.Println(">>> disconnecting voice + gateway")
 	_ = vc.Disconnect()
 	_ = dg.Close()
 
