@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/cartridge-gg/discordgo/dave"
 	"github.com/gorilla/websocket"
@@ -32,6 +33,21 @@ type daveState struct {
 	// Per-user-ID key ratchet cache. The ratchet survives the decryptor and
 	// is re-applied when MLS epoch changes.
 	ratchets map[string]*dave.KeyRatchet
+
+	// Health-tracking fields. Read by VoiceConnection.DAVEHealth so a
+	// supervisor (goclaw, voicedebug) can detect stuck handshakes
+	// (op26 sent but no op30 ever), partial-roster failures (op30
+	// received but ratchets_missing > 0), or epoch divergence (op27
+	// failed with "not for this epoch"). Written from the DAVE op
+	// handlers + Resend/SoftReset code paths.
+	op26SentAt          time.Time
+	op30LastReceived    time.Time
+	op30Received        bool
+	lastMissing         int
+	missingFirstSeen    time.Time
+	lastRosterSize      int
+	externalSender      []byte // cached op25 bytes; needed to re-init libdave on soft-reset
+	proposalFailedSince time.Time // when op27 first started returning empty commits (epoch divergence)
 }
 
 // daveStream ties a Decryptor to the KeyRatchet that feeds it. Both must be
@@ -151,22 +167,45 @@ func (d *daveState) installRatchetForUser(userID string, kr *dave.KeyRatchet) {
 }
 
 // refreshRatchetsForRoster queries libdave for a fresh KeyRatchet per roster
-// member and applies them to their bound decryptors. Called after ProcessCommit
-// or ProcessWelcome when the MLS epoch changes.
+// member AND for every user we have a decryptor for, then applies them to
+// the bound decryptors. Called after ProcessCommit or ProcessWelcome when
+// the MLS epoch changes.
+//
+// Why both: CommitResult.RosterMemberIDs() returns only the members affected
+// by THIS commit (e.g. just the new joiner's leaf). Existing members aren't
+// re-listed even though their per-epoch ratchet rotates. If we relied on
+// rosterMemberIDs alone, an existing speaker's decryptor would keep using
+// the old epoch's ratchet after a new joiner triggered an epoch transition,
+// and their audio would silently fall through as inner-DAVE-encrypted
+// (visible as a partial-roster failure: new joiner OK, existing speaker
+// hallucinates "techno music"). Adding the decryptor-userIDs union here
+// catches that.
 //
 // Returns (installed, missing). Missing > 0 is the smoking gun for
 // "speaker X gets transcribed, speaker Y doesn't" — we have a ratchet
-// for one roster member and not another. The caller should log this
-// at Info so prod is observable; daveState doesn't hold a logger.
+// for one user and not another. The caller should log this at Info so
+// prod is observable; daveState doesn't hold a logger.
 func (d *daveState) refreshRatchetsForRoster(rosterMemberIDs []uint64) (installed, missing int) {
 	d.mu.Lock()
 	sess := d.session
-	d.mu.Unlock()
 	if sess == nil {
+		d.mu.Unlock()
 		return 0, 0
 	}
+	// Build union of (commit roster IDs) + (userIDs we already have
+	// decryptors for). Dedup via a set keyed by stringified userID.
+	want := make(map[string]struct{})
 	for _, id := range rosterMemberIDs {
-		userID := strconv.FormatUint(id, 10)
+		want[strconv.FormatUint(id, 10)] = struct{}{}
+	}
+	for _, s := range d.decryptors {
+		if s.userID != "" {
+			want[s.userID] = struct{}{}
+		}
+	}
+	d.mu.Unlock()
+
+	for userID := range want {
 		kr := sess.GetKeyRatchet(userID)
 		if kr == nil {
 			missing++
@@ -334,6 +373,12 @@ func (v *VoiceConnection) onDAVEExternalSenderPackage(payload []byte) {
 		return
 	}
 	v.dave.session.SetExternalSender(payload)
+	// Cache the external sender bytes — soft-reset replays them through a
+	// freshly init'd libdave session without waiting for Discord to re-send
+	// op25 (which it generally won't on the same voice connection).
+	v.dave.mu.Lock()
+	v.dave.externalSender = append(v.dave.externalSender[:0], payload...)
+	v.dave.mu.Unlock()
 	v.log(LogInformational, "DAVE: op25 SetExternalSender done (len=%d)", len(payload))
 
 	// The client responds to opcode 25 with its own opcode 26 (key package).
@@ -346,6 +391,10 @@ func (v *VoiceConnection) onDAVEExternalSenderPackage(payload []byte) {
 		v.log(LogError, "DAVE: failed to send key package: %s", err)
 		return
 	}
+	v.dave.mu.Lock()
+	v.dave.op26SentAt = time.Now()
+	v.dave.op30Received = false
+	v.dave.mu.Unlock()
 	v.log(LogInformational, "DAVE: op26 key_package SENT (len=%d)", len(kp))
 }
 
@@ -365,6 +414,14 @@ func (v *VoiceConnection) onDAVEProposals(payload []byte) {
 		// "Decrypt failed, no valid cryptor found, ... number of cryptor
 		// managers: 1, pass through enabled: no".
 		v.log(LogWarning, "DAVE: op27 ProcessProposals produced empty commit/welcome — group will not advance")
+		// Mark divergence so the supervisor watchdog can soft-reset.
+		// Only set the timestamp on the FIRST failure since the last
+		// successful op30; recordEpochUpdate clears it on success.
+		v.dave.mu.Lock()
+		if v.dave.proposalFailedSince.IsZero() {
+			v.dave.proposalFailedSince = time.Now()
+		}
+		v.dave.mu.Unlock()
 		return
 	}
 	v.log(LogInformational, "DAVE: op27 → op28 commit/welcome SENDING (len=%d)", len(commitWelcome))
@@ -399,6 +456,7 @@ func (v *VoiceConnection) onDAVEAnnounceCommitTransition(payload []byte) {
 	} else {
 		roster := result.RosterMemberIDs()
 		installed, missing := v.dave.refreshRatchetsForRoster(roster)
+		v.dave.recordEpochUpdate(len(roster), missing)
 		v.log(LogInformational, "DAVE: op29 commit applied transition_id=%d roster=%d ratchets_installed=%d ratchets_missing=%d",
 			transitionID, len(roster), installed, missing)
 	}
@@ -424,6 +482,11 @@ func (v *VoiceConnection) onDAVEWelcome(payload []byte) {
 
 	roster := result.RosterMemberIDs()
 	installed, missing := v.dave.refreshRatchetsForRoster(roster)
+	v.dave.recordEpochUpdate(len(roster), missing)
+	v.dave.mu.Lock()
+	v.dave.op30Received = true
+	v.dave.op30LastReceived = time.Now()
+	v.dave.mu.Unlock()
 	v.log(LogInformational, "DAVE: op30 welcome applied transition_id=%d roster=%d ratchets_installed=%d ratchets_missing=%d",
 		transitionID, len(roster), installed, missing)
 	v.sendDAVEReadyForTransition(transitionID)

@@ -1154,18 +1154,45 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 }
 
 // daveDecryptorFor returns the DAVE Decryptor for the given SSRC, or nil if
-// DAVE is inactive or no decryptor has been minted yet. Called from the hot
-// path in opusReceiver so it holds the dave.mu briefly then releases.
+// DAVE is inactive or no decryptor + ratchet pairing exists for this SSRC.
+// Called from the hot path in opusReceiver.
+//
+// Lazy minting: if no decryptor exists for SSRC but we DO know the SSRC→userID
+// mapping (from a prior or earlier-than-DAVE-init OP5) AND we have a ratchet
+// for that userID, create the decryptor on the fly. This recovers the
+// "OP5-before-OP4" race: Discord sometimes pushes the SpeakingUpdate frames
+// for users who were already in the channel before the bot's voice gateway
+// finished its DAVE handshake (OP4/op25/op26/op30), and onDAVESpeakingUpdate
+// returns early on that path because v.dave is still nil. Without this
+// catch-up, ratchets later installed via refreshRatchetsForRoster have no
+// decryptors to bind to, so all audio for those SSRCs falls through as
+// inner-DAVE-encrypted (TOC histogram looks uniform, ElevenLabs hallucinates
+// "techno music" / "static sound" / etc.).
 func (v *VoiceConnection) daveDecryptorFor(ssrc uint32) *dave.Decryptor {
 	if v.dave == nil {
 		return nil
 	}
 	v.dave.mu.Lock()
-	defer v.dave.mu.Unlock()
 	if s, ok := v.dave.decryptors[ssrc]; ok {
+		v.dave.mu.Unlock()
 		return s.decryptor
 	}
-	return nil
+	v.dave.mu.Unlock()
+
+	// No decryptor — try lazy mint. SSRCUserID returns the userID Discord
+	// sent in OP5 (whether or not v.dave was alive at the time).
+	uid := v.SSRCUserID(ssrc)
+	if uid == "" {
+		return nil
+	}
+	v.dave.mu.Lock()
+	_, haveRatchet := v.dave.ratchets[uid]
+	v.dave.mu.Unlock()
+	if !haveRatchet {
+		return nil
+	}
+	v.log(LogInformational, "DAVE: lazy-minting decryptor ssrc=%d user=%s (OP5-before-OP4 catch-up)", ssrc, uid)
+	return v.dave.ensureDecryptor(ssrc, uid)
 }
 
 // Reconnect will close down a voice connection then immediately try to
