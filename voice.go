@@ -1130,15 +1130,34 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 
 		// DAVE E2EE: peel the inner per-sender AEAD envelope. Active only
 		// when the voice gateway has negotiated a DAVE session (see
-		// voice_dave.go). If libdave is in passthrough or no decryptor
-		// exists for this SSRC yet, Decrypt returns ErrDecryptMissingKey
-		// and we fall through to delivering the outer-decrypted bytes.
+		// voice_dave.go). Three outcomes:
+		//
+		//   * Success → p.Opus replaced with the decrypted plaintext, forward.
+		//   * ErrDecryptMissingKey → DAVE isn't actually wrapping this SSRC
+		//     (passthrough mode, or no decryptor yet). The outer-decrypted
+		//     p.Opus IS real Opus, forward as-is.
+		//   * Any other error → DAVE was supposed to wrap this SSRC but
+		//     something is wrong (auth check failed, key out of sync,
+		//     ratchet wrong, transition window). p.Opus is still inner-DAVE
+		//     ciphertext, NOT real Opus. Drop the packet — forwarding the
+		//     ciphertext lets the consumer's decoder treat random AEAD
+		//     output as Opus, which produces uniform-noise PCM that
+		//     Whisper-class STT models hallucinate from (typically
+		//     YouTube-corpus content like "subscribe to my channel" /
+		//     "see you next time"). Dropping yields silence for the
+		//     affected speaker (a missing transcript), which is correct
+		//     behavior when we don't have valid keys for them.
 		if v.dave != nil {
 			if dec := v.daveDecryptorFor(p.SSRC); dec != nil {
-				if plain, derr := dec.Decrypt(dave.MediaAudio, p.Opus); derr == nil {
+				plain, derr := dec.Decrypt(dave.MediaAudio, p.Opus)
+				switch {
+				case derr == nil:
 					p.Opus = plain
-				} else if derr != dave.ErrDecryptMissingKey {
-					v.log(LogDebug, "DAVE decrypt ssrc=%d: %s", p.SSRC, derr)
+				case derr == dave.ErrDecryptMissingKey:
+					// Fall through — outer plaintext is the real Opus.
+				default:
+					v.log(LogDebug, "DAVE decrypt ssrc=%d: %s (dropping packet)", p.SSRC, derr)
+					continue
 				}
 			}
 		}
