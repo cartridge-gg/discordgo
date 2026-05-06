@@ -59,9 +59,9 @@ func writeOggPage(w io.Writer, payload []byte, headerType byte, granule uint64, 
 func opusHeadPacket() []byte {
 	pkt := make([]byte, 19)
 	copy(pkt[0:8], "OpusHead")
-	pkt[8] = 1                                    // version
-	pkt[9] = 1                                    // channels (mono)
-	binary.LittleEndian.PutUint16(pkt[10:12], 312) // preskip
+	pkt[8] = 1                                       // version
+	pkt[9] = 1                                       // channels (mono)
+	binary.LittleEndian.PutUint16(pkt[10:12], 312)   // preskip
 	binary.LittleEndian.PutUint32(pkt[12:16], 48000) // sample rate
 	binary.LittleEndian.PutUint16(pkt[16:18], 0)
 	pkt[18] = 0
