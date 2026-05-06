@@ -21,21 +21,21 @@ import (
 // in via humansActive). voicedebug's main loop sets that flag when the
 // stats map gains a new SSRC.
 type daveWatchdog struct {
-	vc            *discordgo.VoiceConnection
-	tickEvery        time.Duration
-	stuckTimeout     time.Duration
-	missingTimeout   time.Duration
-	divergedTimeout  time.Duration
-	resendCap        int
-	resendWindow     time.Duration
-	resetCap         int
-	resetWindow      time.Duration
-	humansActive  func() bool
-	log           func(format string, args ...any)
+	vc              *discordgo.VoiceConnection
+	tickEvery       time.Duration
+	stuckTimeout    time.Duration
+	missingTimeout  time.Duration
+	divergedTimeout time.Duration
+	resendCap       int
+	resendWindow    time.Duration
+	resetCap        int
+	resetWindow     time.Duration
+	humansActive    func() bool
+	log             func(format string, args ...any)
 
-	mu          sync.Mutex
-	resends     []time.Time
-	resets      []time.Time
+	mu      sync.Mutex
+	resends []time.Time
+	resets  []time.Time
 }
 
 func newDAVEWatchdog(vc *discordgo.VoiceConnection, humansActive func() bool, log func(string, ...any)) *daveWatchdog {

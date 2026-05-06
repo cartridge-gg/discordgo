@@ -1128,38 +1128,11 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			}
 		}
 
-		// DAVE E2EE: peel the inner per-sender AEAD envelope. Active only
-		// when the voice gateway has negotiated a DAVE session (see
-		// voice_dave.go). Three outcomes:
-		//
-		//   * Success → p.Opus replaced with the decrypted plaintext, forward.
-		//   * ErrDecryptMissingKey → DAVE isn't actually wrapping this SSRC
-		//     (passthrough mode, or no decryptor yet). The outer-decrypted
-		//     p.Opus IS real Opus, forward as-is.
-		//   * Any other error → DAVE was supposed to wrap this SSRC but
-		//     something is wrong (auth check failed, key out of sync,
-		//     ratchet wrong, transition window). p.Opus is still inner-DAVE
-		//     ciphertext, NOT real Opus. Drop the packet — forwarding the
-		//     ciphertext lets the consumer's decoder treat random AEAD
-		//     output as Opus, which produces uniform-noise PCM that
-		//     Whisper-class STT models hallucinate from (typically
-		//     YouTube-corpus content like "subscribe to my channel" /
-		//     "see you next time"). Dropping yields silence for the
-		//     affected speaker (a missing transcript), which is correct
-		//     behavior when we don't have valid keys for them.
-		if v.dave != nil {
-			if dec := v.daveDecryptorFor(p.SSRC); dec != nil {
-				plain, derr := dec.Decrypt(dave.MediaAudio, p.Opus)
-				switch {
-				case derr == nil:
-					p.Opus = plain
-				case derr == dave.ErrDecryptMissingKey:
-					// Fall through — outer plaintext is the real Opus.
-				default:
-					v.log(LogDebug, "DAVE decrypt ssrc=%d: %s (dropping packet)", p.SSRC, derr)
-					continue
-				}
-			}
+		if decision := v.applyDAVEDecrypt(p.SSRC, p.Opus); !decision.forward {
+			v.log(LogDebug, "DAVE decrypt ssrc=%d: %s (dropping packet)", p.SSRC, decision.reason)
+			continue
+		} else {
+			p.Opus = decision.opus
 		}
 
 		if c != nil {
@@ -1170,6 +1143,48 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			}
 		}
 	}
+}
+
+type daveDecryptDecision struct {
+	opus    []byte
+	forward bool
+	reason  string
+}
+
+// applyDAVEDecrypt peels the DAVE inner envelope when DAVE is active.
+//
+// The important safety property is fail-closed behaviour: if the gateway has
+// negotiated a non-zero DAVE protocol version, bytes are forwarded only after
+// a successful inner decrypt. Missing SSRC mappings, missing ratchets, and
+// decrypt failures all produce silence instead of letting AEAD ciphertext
+// reach Opus/STT consumers.
+func (v *VoiceConnection) applyDAVEDecrypt(ssrc uint32, opus []byte) daveDecryptDecision {
+	if v.dave == nil {
+		return daveDecryptDecision{opus: opus, forward: true}
+	}
+	if v.daveProtocolVersion() == 0 {
+		return daveDecryptDecision{opus: opus, forward: true}
+	}
+
+	dec, reason := v.daveDecryptorFor(ssrc)
+	if dec == nil {
+		return daveDecryptDecision{forward: false, reason: reason}
+	}
+
+	plain, err := dec.Decrypt(dave.MediaAudio, opus)
+	if err != nil {
+		return daveDecryptDecision{forward: false, reason: err.Error()}
+	}
+	return daveDecryptDecision{opus: plain, forward: true}
+}
+
+func (v *VoiceConnection) daveProtocolVersion() uint16 {
+	if v.dave == nil {
+		return 0
+	}
+	v.dave.mu.Lock()
+	defer v.dave.mu.Unlock()
+	return v.dave.protocolVersion
 }
 
 // daveDecryptorFor returns the DAVE Decryptor for the given SSRC, or nil if
@@ -1187,14 +1202,17 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 // decryptors to bind to, so all audio for those SSRCs falls through as
 // inner-DAVE-encrypted (TOC histogram looks uniform, ElevenLabs hallucinates
 // "techno music" / "static sound" / etc.).
-func (v *VoiceConnection) daveDecryptorFor(ssrc uint32) *dave.Decryptor {
+func (v *VoiceConnection) daveDecryptorFor(ssrc uint32) (*dave.Decryptor, string) {
 	if v.dave == nil {
-		return nil
+		return nil, "inactive"
 	}
 	v.dave.mu.Lock()
 	if s, ok := v.dave.decryptors[ssrc]; ok {
 		v.dave.mu.Unlock()
-		return s.decryptor
+		if s == nil || s.decryptor == nil {
+			return nil, "nil_decryptor"
+		}
+		return s.decryptor, ""
 	}
 	v.dave.mu.Unlock()
 
@@ -1202,16 +1220,20 @@ func (v *VoiceConnection) daveDecryptorFor(ssrc uint32) *dave.Decryptor {
 	// sent in OP5 (whether or not v.dave was alive at the time).
 	uid := v.SSRCUserID(ssrc)
 	if uid == "" {
-		return nil
+		return nil, "no_user"
 	}
 	v.dave.mu.Lock()
 	_, haveRatchet := v.dave.ratchets[uid]
 	v.dave.mu.Unlock()
 	if !haveRatchet {
-		return nil
+		return nil, "no_ratchet"
 	}
 	v.log(LogInformational, "DAVE: lazy-minting decryptor ssrc=%d user=%s (OP5-before-OP4 catch-up)", ssrc, uid)
-	return v.dave.ensureDecryptor(ssrc, uid)
+	dec := v.dave.ensureDecryptor(ssrc, uid)
+	if dec == nil {
+		return nil, "no_decryptor"
+	}
+	return dec, ""
 }
 
 // Reconnect will close down a voice connection then immediately try to

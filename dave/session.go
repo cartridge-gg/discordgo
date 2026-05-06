@@ -1,6 +1,7 @@
 package dave
 
 /*
+#include <stdint.h>
 #include <stdlib.h>
 #include <dave/dave.h>
 
@@ -12,8 +13,8 @@ extern void goDaveOnMLSFailure(char* source, char* reason, void* userData);
 
 // Convenience wrapper so the Go side doesn't need to name-mangle the
 // trampoline function-pointer cast for each daveSessionCreate call.
-static inline DAVESessionHandle dave_session_create(const char* authSessionId, void* userData) {
-    return daveSessionCreate(NULL, authSessionId, (DAVEMLSFailureCallback)goDaveOnMLSFailure, userData);
+static inline DAVESessionHandle dave_session_create(const char* authSessionId, uintptr_t userData) {
+    return daveSessionCreate(NULL, authSessionId, (DAVEMLSFailureCallback)goDaveOnMLSFailure, (void*)userData);
 }
 */
 import "C"
@@ -49,7 +50,7 @@ func NewSession(authSessionID string, onFail MLSFailureFunc) *Session {
 	cAuth := C.CString(authSessionID)
 	defer C.free(unsafe.Pointer(cAuth))
 
-	s.handle = C.dave_session_create(cAuth, unsafe.Pointer(uintptr(s.handleRef)))
+	s.handle = C.dave_session_create(cAuth, C.uintptr_t(s.handleRef))
 	// No finalizer: cgo.NewHandle pins this Session for the lifetime of the
 	// cgo.Handle, so GC cannot collect it until Destroy runs handleRef.Delete().
 	// Destroy MUST be called by the owning code (VoiceConnection.Close).

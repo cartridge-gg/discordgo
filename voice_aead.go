@@ -35,9 +35,9 @@ import (
 )
 
 const (
-	encModeAEADAESGCMRTPSize     = "aead_aes256_gcm_rtpsize"
+	encModeAEADAESGCMRTPSize      = "aead_aes256_gcm_rtpsize"
 	encModeAEADXChaChaPolyRTPSize = "aead_xchacha20_poly1305_rtpsize"
-	encModeXSalsa20Poly1305      = "xsalsa20_poly1305"
+	encModeXSalsa20Poly1305       = "xsalsa20_poly1305"
 )
 
 // preferredVoiceEncryptionModes lists Discord-supported voice cipher modes
@@ -145,10 +145,10 @@ func rtpExtPayloadBytes(packet []byte) int {
 //   - the 32-bit nonce counter sits at the END of the packet (4 bytes)
 //   - that counter is copied to the FIRST 4 bytes of the 12-byte nonce
 //     (Discord's encoder uses LittleEndian.PutUint32 on nonce[0:4], and
-//      the counter byte ordering in the packet matches that, so a verbatim
-//      copy here is correct).
+//     the counter byte ordering in the packet matches that, so a verbatim
+//     copy here is correct).
 //   - the AAD is the unencrypted RTP header bytes (fixed header + CSRCs
-//     + 4-byte extension preamble if X bit set), NOT the extension data.
+//   - 4-byte extension preamble if X bit set), NOT the extension data.
 //   - the encrypted region is everything between AAD and the counter,
 //     including the extension payload (which the caller strips after
 //     decrypting).

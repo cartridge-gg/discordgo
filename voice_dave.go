@@ -46,7 +46,7 @@ type daveState struct {
 	lastMissing         int
 	missingFirstSeen    time.Time
 	lastRosterSize      int
-	externalSender      []byte // cached op25 bytes; needed to re-init libdave on soft-reset
+	externalSender      []byte    // cached op25 bytes; needed to re-init libdave on soft-reset
 	proposalFailedSince time.Time // when op27 first started returning empty commits (epoch divergence)
 }
 

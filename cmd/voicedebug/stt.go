@@ -20,12 +20,12 @@ import (
 // SSRC, or by the ceiling watchdog when first-packet age exceeds
 // maxUtteranceAge.
 type utteranceBuf struct {
-	mu       sync.Mutex
-	frames   [][]byte
-	first    time.Time
-	last     time.Time
-	userID   string
-	display  string // resolved display name; empty until first GuildMember lookup
+	mu      sync.Mutex
+	frames  [][]byte
+	first   time.Time
+	last    time.Time
+	userID  string
+	display string // resolved display name; empty until first GuildMember lookup
 }
 
 func (u *utteranceBuf) append(opus []byte) {
@@ -56,16 +56,16 @@ func (u *utteranceBuf) take() (frames [][]byte, first time.Time, userID, display
 // sttManager owns per-SSRC utterance buffers and dispatches completed
 // utterances to ElevenLabs.
 type sttManager struct {
-	apiKey       string
-	language     string
-	utterDir     string
-	gapMs        int
-	maxAgeMs     int
-	minMs        int
-	resolveName  func(userID string) string
-	bufs         sync.Map // ssrc → *utteranceBuf
-	httpClient   *http.Client
-	log          func(format string, args ...any)
+	apiKey      string
+	language    string
+	utterDir    string
+	gapMs       int
+	maxAgeMs    int
+	minMs       int
+	resolveName func(userID string) string
+	bufs        sync.Map // ssrc → *utteranceBuf
+	httpClient  *http.Client
+	log         func(format string, args ...any)
 }
 
 func newSTTManager(apiKey, language, utterDir string, resolveName func(string) string, log func(string, ...any)) *sttManager {
