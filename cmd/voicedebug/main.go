@@ -15,7 +15,8 @@
 //
 // Usage:
 //
-//	go run ./cmd/voicedebug -token-file /tmp/discord-token -guild-id ... -voice-channel-id ...
+//	gcloud secrets versions access latest --secret=agent-discord-eng-token --project=c7e-prod |
+//		go run ./cmd/voicedebug -token-stdin -guild-id ... -voice-channel-id ...
 //
 // Ctrl-C cleanly disconnects and prints final per-SSRC stats.
 package main
@@ -23,6 +24,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -53,6 +55,7 @@ func main() {
 		"if set, POST each utterance to ElevenLabs Scribe and print the transcript to stdout. Defaults to $ELEVENLABS_API_KEY.")
 	sttLang := flag.String("stt-language", "", "ISO 639-1 language hint passed to ElevenLabs (e.g. 'en'). Empty = auto-detect.")
 	tokenFile := flag.String("token-file", "", "file containing the Discord bot token; preferred over $DISCORD_TOKEN for local debugging")
+	tokenStdin := flag.Bool("token-stdin", false, "read the Discord bot token from stdin; preferred for automation that should not write secrets to disk")
 	guildFlag := flag.String("guild-id", os.Getenv("GUILD_ID"), "Discord guild ID. Defaults to $GUILD_ID.")
 	channelFlag := flag.String("voice-channel-id", os.Getenv("VOICE_CHANNEL_ID"), "Discord voice channel ID. Defaults to $VOICE_CHANNEL_ID.")
 	handlerDelay := flag.Duration("handler-delay", 0,
@@ -69,6 +72,13 @@ func main() {
 		data, err := os.ReadFile(*tokenFile)
 		if err != nil {
 			log.Fatalf("read token file: %v", err)
+		}
+		token = strings.TrimSpace(string(data))
+	}
+	if *tokenStdin {
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			log.Fatalf("read token stdin: %v", err)
 		}
 		token = strings.TrimSpace(string(data))
 	}
