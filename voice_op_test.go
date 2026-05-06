@@ -294,6 +294,66 @@ func daveStateForTest() *daveState {
 	}
 }
 
+func TestApplyDAVEDecrypt_ForwardsWhenDAVEInactive(t *testing.T) {
+	v := newTestVoiceConn()
+	opus := []byte{0x11, 0x22}
+
+	got := v.applyDAVEDecrypt(123, opus)
+
+	if !got.forward {
+		t.Fatalf("forward = false, reason=%q", got.reason)
+	}
+	if string(got.opus) != string(opus) {
+		t.Fatalf("opus = %v, want %v", got.opus, opus)
+	}
+}
+
+func TestApplyDAVEDecrypt_ForwardsWhenProtocolPassthrough(t *testing.T) {
+	v := newTestVoiceConn()
+	v.dave = daveStateForTest()
+	opus := []byte{0x33, 0x44}
+
+	got := v.applyDAVEDecrypt(123, opus)
+
+	if !got.forward {
+		t.Fatalf("forward = false, reason=%q", got.reason)
+	}
+	if string(got.opus) != string(opus) {
+		t.Fatalf("opus = %v, want %v", got.opus, opus)
+	}
+}
+
+func TestApplyDAVEDecrypt_DropsActiveDAVEWithoutSSRCUser(t *testing.T) {
+	v := newTestVoiceConn()
+	v.dave = daveStateForTest()
+	v.dave.protocolVersion = 1
+
+	got := v.applyDAVEDecrypt(123, []byte{0x55})
+
+	if got.forward {
+		t.Fatalf("forward = true, want drop")
+	}
+	if got.reason != "no_user" {
+		t.Fatalf("reason = %q, want no_user", got.reason)
+	}
+}
+
+func TestApplyDAVEDecrypt_DropsActiveDAVEWithoutRatchet(t *testing.T) {
+	v := newTestVoiceConn()
+	v.dave = daveStateForTest()
+	v.dave.protocolVersion = 1
+	v.ssrcUserIDs = map[uint32]string{123: "999"}
+
+	got := v.applyDAVEDecrypt(123, []byte{0x66})
+
+	if got.forward {
+		t.Fatalf("forward = true, want drop")
+	}
+	if got.reason != "no_ratchet" {
+		t.Fatalf("reason = %q, want no_ratchet", got.reason)
+	}
+}
+
 func TestVoiceOnEventOP21_DAVESession_PassthroughDowngrade(t *testing.T) {
 	// OP21 with protocol_version=0 (downgrade) should iterate
 	// decryptors and flip them to passthrough. With an empty
