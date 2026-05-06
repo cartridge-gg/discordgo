@@ -15,10 +15,7 @@
 //
 // Usage:
 //
-//	export DISCORD_TOKEN="$(gcloud secrets versions access latest --secret=agent-discord-eng-token --project=c7e-prod)"
-//	export GUILD_ID=954866867376357397
-//	export VOICE_CHANNEL_ID=960655952116346931
-//	go run ./cmd/voicedebug
+//	go run ./cmd/voicedebug -token-file /tmp/discord-token -guild-id ... -voice-channel-id ...
 //
 // Ctrl-C cleanly disconnects and prints final per-SSRC stats.
 package main
@@ -31,6 +28,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -54,6 +52,9 @@ func main() {
 	sttKey := flag.String("stt-elevenlabs", os.Getenv("ELEVENLABS_API_KEY"),
 		"if set, POST each utterance to ElevenLabs Scribe and print the transcript to stdout. Defaults to $ELEVENLABS_API_KEY.")
 	sttLang := flag.String("stt-language", "", "ISO 639-1 language hint passed to ElevenLabs (e.g. 'en'). Empty = auto-detect.")
+	tokenFile := flag.String("token-file", "", "file containing the Discord bot token; preferred over $DISCORD_TOKEN for local debugging")
+	guildFlag := flag.String("guild-id", os.Getenv("GUILD_ID"), "Discord guild ID. Defaults to $GUILD_ID.")
+	channelFlag := flag.String("voice-channel-id", os.Getenv("VOICE_CHANNEL_ID"), "Discord voice channel ID. Defaults to $VOICE_CHANNEL_ID.")
 	handlerDelay := flag.Duration("handler-delay", 0,
 		"sleep this long between ChannelVoiceJoin returning and registering the "+
 			"VoiceSpeakingUpdate handler. Simulates goclaw's onJoinSuccess REST window "+
@@ -64,10 +65,17 @@ func main() {
 	}
 
 	token := os.Getenv("DISCORD_TOKEN")
-	guildID := os.Getenv("GUILD_ID")
-	channelID := os.Getenv("VOICE_CHANNEL_ID")
+	if *tokenFile != "" {
+		data, err := os.ReadFile(*tokenFile)
+		if err != nil {
+			log.Fatalf("read token file: %v", err)
+		}
+		token = strings.TrimSpace(string(data))
+	}
+	guildID := *guildFlag
+	channelID := *channelFlag
 	if token == "" || guildID == "" || channelID == "" {
-		log.Fatal("set DISCORD_TOKEN, GUILD_ID, VOICE_CHANNEL_ID")
+		log.Fatal("set DISCORD_TOKEN or -token-file, plus GUILD_ID/-guild-id and VOICE_CHANNEL_ID/-voice-channel-id")
 	}
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		log.Fatalf("mkdir %s: %v", *outDir, err)
